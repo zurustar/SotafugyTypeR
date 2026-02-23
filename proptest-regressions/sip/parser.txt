@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 947d5d32f7d0d5056b802fd001032f8c8bedf449a57c5091f55632c99341b5f5 # shrinks to status_code = 100, reason = "aaAA aAA", cut_len = 22
+cc f45891cc5b3f445c0cefd7841525374013ab4b4de6bbbd0e9f7bb9ce81e27707 # shrinks to method = "INVITE", uri = "aa:aaaaaaaaa@aaaaaaa.aaa", cut_len = 41

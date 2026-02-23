@@ -1,0 +1,112 @@
+{
+  "config": {
+    "proxy_host": "127.0.0.1",
+    "proxy_port": 5060,
+    "uac_host": "127.0.0.1",
+    "uac_port": 5070,
+    "uas_host": "127.0.0.1",
+    "uas_port": 5080,
+    "target_cps": 100.0,
+    "max_dialogs": 50000,
+    "duration": 30,
+    "scenario": "invite_bye",
+    "pattern": {
+      "type": "sustained",
+      "duration_secs": 60
+    },
+    "call_duration": 5,
+    "health_check_timeout": 5,
+    "health_check_retries": 3,
+    "shutdown_timeout": 10,
+    "uac_port_count": 1,
+    "uas_port_count": 1,
+    "bg_register_count": 0,
+    "users_file": null,
+    "auth_enabled": false,
+    "auth_realm": "sip-load-test",
+    "mode": "binary_search",
+    "step_up": null,
+    "binary_search": {
+      "initial_cps": 100.0,
+      "step_size": 10.0,
+      "step_duration": 15,
+      "error_threshold": 0.01,
+      "convergence_threshold": 5.0,
+      "cooldown_duration": 3
+    }
+  },
+  "total_calls": 0,
+  "successful_calls": 0,
+  "failed_calls": 0,
+  "auth_failures": 0,
+  "max_stable_cps": 0.0,
+  "latency_p50_ms": 0.0,
+  "latency_p90_ms": 0.0,
+  "latency_p95_ms": 0.0,
+  "latency_p99_ms": 0.0,
+  "status_codes": {},
+  "started_at": "1771838588",
+  "finished_at": "1771838693",
+  "steps": [
+    {
+      "step": 1,
+      "phase": "expand",
+      "target_cps": 100.0,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    },
+    {
+      "step": 2,
+      "phase": "binary_search",
+      "target_cps": 50.0,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    },
+    {
+      "step": 3,
+      "phase": "binary_search",
+      "target_cps": 25.0,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    },
+    {
+      "step": 4,
+      "phase": "binary_search",
+      "target_cps": 12.5,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    },
+    {
+      "step": 5,
+      "phase": "binary_search",
+      "target_cps": 6.25,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    },
+    {
+      "step": 6,
+      "phase": "binary_search",
+      "target_cps": 3.125,
+      "total_calls": 0,
+      "successful_calls": 0,
+      "failed_calls": 0,
+      "error_rate": 1.0,
+      "result": "fail"
+    }
+  ]
+}

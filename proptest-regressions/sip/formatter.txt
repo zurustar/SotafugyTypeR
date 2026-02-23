@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c9585376ef704047f274899840ee59da084545b063867e620dffee0d8fe2a6a9 # shrinks to msg = Response(SipResponse { version: "SIP/2.0", status_code: 100, reason_phrase: " ", headers: Headers { entries: [] }, body: None })
