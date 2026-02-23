@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 39f1601c4f08f29410a0b12b0468eca25081b52d0822050bdf6efb51c92908a8 # shrinks to (proxy_addr, _local_addr) = (0.0.0.0:1024, 0.0.0.0:1025), call_id = "0000000aaa00128f", from_tag = "s8dvfpats55s"
+cc 62ca150feca0856161c3e3c7eb78b994c894f753f91c21b6b8622aab8ceeea99 # shrinks to (proxy_addr, _local_addr) = (0.0.0.0:1024, 0.0.0.0:1025), call_id = "0aaa0aaaaaaa016b", from_tag = "162yye8lucr"
+cc e4d1ae44aebf4e1b5f68aa333cf2b8f7267e68d755f530c008fa08b076d8a23f # shrinks to (proxy_addr, local_addr) = (0.0.0.0:1024, 0.0.0.0:1025), call_id = "a0a000000001a9d2", from_tag = "3xr1"
+cc f11f5dad8cd8f1183e66880005472535a260a448f643788641fe0ddef8ad9ef1 # shrinks to (proxy_addr, local_addr) = (0.0.0.0:1024, 0.0.0.0:1025), call_id = "aa0a000000aa00a0", from_tag = "761tn8b"

@@ -94,6 +94,7 @@ async fn run_load_test(
 
     let uac_config = UacConfig {
         proxy_addr,
+        local_addr: std::net::SocketAddr::new(uac_addr, cfg.uac_port),
         call_duration: Duration::from_secs(cfg.call_duration),
         dialog_timeout: Duration::from_secs(32),
     };

@@ -23,6 +23,7 @@ use crate::user_pool::{UserEntry, UserPool};
 #[derive(Debug, Clone)]
 pub struct UacConfig {
     pub proxy_addr: SocketAddr,
+    pub local_addr: SocketAddr,
     pub call_duration: Duration,
     pub dialog_timeout: Duration,
 }
@@ -31,6 +32,7 @@ impl Default for UacConfig {
     fn default() -> Self {
         Self {
             proxy_addr: "127.0.0.1:5060".parse().unwrap(),
+            local_addr: "127.0.0.1:5060".parse().unwrap(),
             call_duration: Duration::from_secs(3),
             dialog_timeout: Duration::from_secs(32),
         }
@@ -366,6 +368,7 @@ impl Uac {
             let transport = self.transport.clone();
             let dialog_manager = self.dialog_manager.clone();
             let proxy_addr = self.config.proxy_addr;
+            let local_addr = self.config.local_addr;
             let call_id_owned = call_id.to_string();
 
             tokio::spawn(async move {
@@ -384,7 +387,7 @@ impl Uac {
                             &from_tag,
                             to_tag.as_deref(),
                             cseq + 1,
-                            proxy_addr,
+                            local_addr,
                         );
                         let reinvite_bytes = format_sip_message(&SipMessage::Request(reinvite));
                         let _ = transport.send_to(&reinvite_bytes, proxy_addr).await;
@@ -404,6 +407,7 @@ impl Uac {
         let _stats = self.stats.clone();
         let call_duration = self.config.call_duration;
         let proxy_addr = self.config.proxy_addr;
+        let local_addr = self.config.local_addr;
         let call_id_owned = call_id.to_string();
 
         tokio::spawn(async move {
@@ -422,7 +426,7 @@ impl Uac {
                         &from_tag,
                         to_tag.as_deref(),
                         cseq + 1,
-                        proxy_addr,
+                        local_addr,
                     );
                     let bye_bytes = format_sip_message(&SipMessage::Request(bye));
                     let _ = transport.send_to(&bye_bytes, proxy_addr).await;
@@ -619,7 +623,7 @@ impl Uac {
         let mut headers = Headers::new();
         headers.add(
             "Via",
-            format!("SIP/2.0/UDP {};branch=z9hG4bK{}", self.config.proxy_addr, &dialog.call_id[..16]),
+            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "REGISTER")),
         );
         headers.set(
             "From",
@@ -648,7 +652,7 @@ impl Uac {
         let mut headers = Headers::new();
         headers.add(
             "Via",
-            format!("SIP/2.0/UDP {};branch=z9hG4bK{}", self.config.proxy_addr, &dialog.call_id[..16]),
+            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "INVITE")),
         );
         headers.set(
             "From",
@@ -683,7 +687,7 @@ impl Uac {
         let mut headers = Headers::new();
         headers.add(
             "Via",
-            format!("SIP/2.0/UDP {};branch=z9hG4bK{}", self.config.proxy_addr, &call_id[..16]),
+            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(call_id, cseq, "ACK")),
         );
         headers.set("Call-ID", call_id.to_string());
         headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
@@ -714,7 +718,7 @@ impl Uac {
         to_tag: Option<&str>,
         cseq: u32,
     ) -> SipRequest {
-        build_bye_request_static(call_id, from_tag, to_tag, cseq, self.config.proxy_addr)
+        build_bye_request_static(call_id, from_tag, to_tag, cseq, self.config.local_addr)
     }
 }
 
@@ -724,12 +728,12 @@ fn build_reinvite_request_static(
     from_tag: &str,
     to_tag: Option<&str>,
     cseq: u32,
-    proxy_addr: SocketAddr,
+    local_addr: SocketAddr,
 ) -> SipRequest {
     let mut headers = Headers::new();
     headers.add(
         "Via",
-        format!("SIP/2.0/UDP {};branch=z9hG4bK{}", proxy_addr, &call_id[..16]),
+        format!("SIP/2.0/UDP {};branch={}", local_addr, crate::sip::generate_branch(call_id, cseq, "INVITE")),
     );
     headers.set("Call-ID", call_id.to_string());
     headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
@@ -758,12 +762,12 @@ fn build_bye_request_static(
     from_tag: &str,
     to_tag: Option<&str>,
     cseq: u32,
-    proxy_addr: SocketAddr,
+    local_addr: SocketAddr,
 ) -> SipRequest {
     let mut headers = Headers::new();
     headers.add(
         "Via",
-        format!("SIP/2.0/UDP {};branch=z9hG4bK{}", proxy_addr, &call_id[..16]),
+        format!("SIP/2.0/UDP {};branch={}", local_addr, crate::sip::generate_branch(call_id, cseq, "BYE")),
     );
     headers.set("Call-ID", call_id.to_string());
     headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
@@ -794,10 +798,506 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::stats::StatsCollector;
     use crate::user_pool::{UserPool, UsersFile, UserEntry};
-    use crate::dialog::DialogManager;
+    use crate::dialog::{Dialog, DialogManager, DialogState};
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    use proptest::prelude::*;
+
+    // ===== proptest helpers =====
+
+    /// Generate an arbitrary SocketAddr (IPv4) for proptest
+    fn arb_socket_addr() -> impl Strategy<Value = SocketAddr> {
+        (any::<[u8; 4]>(), 1024u16..65535)
+            .prop_map(|(ip, port)| {
+                let addr = std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                SocketAddr::new(std::net::IpAddr::V4(addr), port)
+            })
+    }
+
+    /// Generate a pair of distinct SocketAddrs (proxy_addr != local_addr)
+    fn arb_distinct_addr_pair() -> impl Strategy<Value = (SocketAddr, SocketAddr)> {
+        (arb_socket_addr(), arb_socket_addr())
+            .prop_filter("proxy_addr must differ from local_addr", |(a, b)| a != b)
+    }
+
+    /// Generate a valid call_id (at least 16 hex chars for branch extraction)
+    fn arb_call_id() -> impl Strategy<Value = String> {
+        "[0-9a-f]{16,32}".prop_map(|s| s)
+    }
+
+    /// Generate a valid from_tag
+    fn arb_from_tag() -> impl Strategy<Value = String> {
+        "[a-z0-9]{4,12}".prop_map(|s| s)
+    }
+
+    /// Extract the address portion from a Via header value
+    /// e.g. "SIP/2.0/UDP 192.168.1.1:5060;branch=z9hG4bK..." -> "192.168.1.1:5060"
+    fn extract_via_addr(via_value: &str) -> &str {
+        let after_udp = via_value
+            .find("SIP/2.0/UDP ")
+            .map(|i| &via_value[i + 12..])
+            .unwrap_or(via_value);
+        after_udp.split(';').next().unwrap_or(after_udp).trim()
+    }
+
+    // ===== Bug condition exploration property tests (Property 1: Fault Condition) =====
+    // **Validates: Requirements 1.1, 1.2, 2.1, 2.2**
+    //
+    // These tests assert that Via headers contain local_addr (the expected behavior).
+    // On unfixed code they will FAIL, proving the bug exists: Via contains proxy_addr instead.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn pbt_build_invite_request_via_contains_local_addr(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+        ) {
+            // Arrange: create Uac with proxy_addr in config
+            let config = UacConfig {
+                proxy_addr,
+                local_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+            let dialog = Dialog {
+                call_id: call_id.clone(),
+                from_tag,
+                to_tag: None,
+                state: DialogState::Trying,
+                cseq: 1,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            let user = &UserEntry {
+                username: "alice".to_string(),
+                domain: "example.com".to_string(),
+                password: "secret".to_string(),
+            };
+
+            // Act
+            let request = uac.build_invite_request(&dialog, user);
+
+            // Assert: Via header should contain local_addr, not proxy_addr
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let via_addr_str = extract_via_addr(&via);
+            let expected = local_addr.to_string();
+            prop_assert!(
+                via_addr_str == expected,
+                "INVITE Via header should contain local_addr ({}), but got {}",
+                expected,
+                via_addr_str
+            );
+        }
+
+        #[test]
+        fn pbt_build_register_request_via_contains_local_addr(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+        ) {
+            let config = UacConfig {
+                proxy_addr,
+                local_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+            let dialog = Dialog {
+                call_id: call_id.clone(),
+                from_tag,
+                to_tag: None,
+                state: DialogState::Trying,
+                cseq: 1,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            let user = &UserEntry {
+                username: "alice".to_string(),
+                domain: "example.com".to_string(),
+                password: "secret".to_string(),
+            };
+
+            let request = uac.build_register_request(&dialog, user);
+
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let via_addr_str = extract_via_addr(&via);
+            let expected = local_addr.to_string();
+            prop_assert!(
+                via_addr_str == expected,
+                "REGISTER Via header should contain local_addr ({}), but got {}",
+                expected,
+                via_addr_str
+            );
+        }
+
+        #[test]
+        fn pbt_build_ack_request_via_contains_local_addr(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+        ) {
+            let config = UacConfig {
+                proxy_addr,
+                local_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+
+            let request = uac.build_ack_request(&call_id, &from_tag, None, 1);
+
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let via_addr_str = extract_via_addr(&via);
+            let expected = local_addr.to_string();
+            prop_assert!(
+                via_addr_str == expected,
+                "ACK Via header should contain local_addr ({}), but got {}",
+                expected,
+                via_addr_str
+            );
+        }
+
+        #[test]
+        fn pbt_build_bye_request_static_via_contains_local_addr(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+        ) {
+            // After fix: build_bye_request_static receives local_addr and uses it in Via.
+            let request = build_bye_request_static(&call_id, &from_tag, None, 1, local_addr);
+
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let via_addr_str = extract_via_addr(&via);
+            let expected = local_addr.to_string();
+            let not_expected = proxy_addr.to_string();
+            // Via should contain local_addr, not proxy_addr
+            prop_assert!(
+                via_addr_str == expected,
+                "BYE Via header should contain local_addr ({}), but got {}",
+                expected,
+                via_addr_str
+            );
+            prop_assert!(
+                via_addr_str != not_expected,
+                "BYE Via header should not contain proxy_addr ({}), but it does",
+                not_expected
+            );
+        }
+
+        #[test]
+        fn pbt_build_reinvite_request_static_via_contains_local_addr(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+        ) {
+            // After fix: build_reinvite_request_static receives local_addr and uses it in Via.
+            let request = build_reinvite_request_static(&call_id, &from_tag, None, 1, local_addr);
+
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let via_addr_str = extract_via_addr(&via);
+            let expected = local_addr.to_string();
+            let not_expected = proxy_addr.to_string();
+            prop_assert!(
+                via_addr_str == expected,
+                "re-INVITE Via header should contain local_addr ({}), but got {}",
+                expected,
+                via_addr_str
+            );
+            prop_assert!(
+                via_addr_str != not_expected,
+                "re-INVITE Via header should not contain proxy_addr ({}), but it does",
+                not_expected
+            );
+        }
+    }
+
+    // ===== Preservation property tests (Property 2: Preservation) =====
+    // **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7**
+    //
+    // These tests verify that non-Via headers and request structure are preserved.
+    // They capture the baseline behavior of the unfixed code and must continue
+    // to pass after the Via header fix is applied.
+
+    /// Generate an arbitrary username for proptest
+    fn arb_username() -> impl Strategy<Value = String> {
+        "[a-z]{3,8}".prop_map(|s| s)
+    }
+
+    /// Generate an arbitrary domain for proptest
+    fn arb_domain() -> impl Strategy<Value = String> {
+        "[a-z]{3,8}\\.[a-z]{2,4}".prop_map(|s| s)
+    }
+
+    /// Generate an arbitrary cseq number
+    fn arb_cseq() -> impl Strategy<Value = u32> {
+        1u32..10000
+    }
+
+    /// Extract the branch value from a Via header
+    /// e.g. "SIP/2.0/UDP 1.2.3.4:5060;branch=z9hG4bKabcdef0123456789" -> "z9hG4bKabcdef0123456789"
+    fn extract_via_branch(via_value: &str) -> &str {
+        via_value
+            .find("branch=")
+            .map(|i| {
+                let start = i + 7;
+                let rest = &via_value[start..];
+                rest.split(';').next().unwrap_or(rest).trim()
+            })
+            .unwrap_or("")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Preservation: build_invite_request produces correct non-Via headers and request structure
+        #[test]
+        fn pbt_invite_preserves_headers_and_structure(
+            proxy_addr in arb_socket_addr(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+            username in arb_username(),
+            domain in arb_domain(),
+            cseq in arb_cseq(),
+        ) {
+            let config = UacConfig {
+                proxy_addr,
+                local_addr: proxy_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+            let dialog = Dialog {
+                call_id: call_id.clone(),
+                from_tag: from_tag.clone(),
+                to_tag: None,
+                state: DialogState::Trying,
+                cseq,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            let user = UserEntry {
+                username: username.clone(),
+                domain: domain.clone(),
+                password: "secret".to_string(),
+            };
+
+            let request = uac.build_invite_request(&dialog, &user);
+
+            // From header
+            let from = request.headers.get("From").expect("From header must exist");
+            let expected_from = format!("<sip:{}@{}>;tag={}", username, domain, from_tag);
+            prop_assert_eq!(&from, &expected_from, "From header mismatch");
+
+            // To header
+            let to = request.headers.get("To").expect("To header must exist");
+            let expected_to = format!("<sip:{}@{}>", username, domain);
+            prop_assert_eq!(&to, &expected_to, "To header mismatch");
+
+            // Call-ID
+            let cid = request.headers.get("Call-ID").expect("Call-ID header must exist");
+            prop_assert_eq!(&cid, &call_id, "Call-ID mismatch");
+
+            // CSeq (INVITE)
+            let cseq_hdr = request.headers.get("CSeq").expect("CSeq header must exist");
+            let expected_cseq = format!("{} INVITE", cseq);
+            prop_assert_eq!(&cseq_hdr, &expected_cseq, "CSeq mismatch");
+
+            // Max-Forwards
+            let mf = request.headers.get("Max-Forwards").expect("Max-Forwards header must exist");
+            prop_assert_eq!(mf, "70".to_string(), "Max-Forwards mismatch");
+
+            // Content-Length
+            let cl = request.headers.get("Content-Length").expect("Content-Length header must exist");
+            prop_assert_eq!(cl, "0".to_string(), "Content-Length mismatch");
+
+            // Request URI
+            let expected_uri = format!("sip:{}@{}", username, domain);
+            prop_assert_eq!(&request.request_uri, &expected_uri, "Request URI mismatch");
+
+            // Via branch value: must start with z9hG4bK magic cookie
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let branch = extract_via_branch(&via);
+            prop_assert!(
+                branch.starts_with("z9hG4bK"),
+                "Via branch must start with z9hG4bK magic cookie, got: {}",
+                branch
+            );
+        }
+
+        /// Preservation: build_register_request produces correct non-Via headers and request structure
+        #[test]
+        fn pbt_register_preserves_headers_and_structure(
+            proxy_addr in arb_socket_addr(),
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+            username in arb_username(),
+            domain in arb_domain(),
+            cseq in arb_cseq(),
+        ) {
+            let config = UacConfig {
+                proxy_addr,
+                local_addr: proxy_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+            let dialog = Dialog {
+                call_id: call_id.clone(),
+                from_tag: from_tag.clone(),
+                to_tag: None,
+                state: DialogState::Trying,
+                cseq,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            let user = UserEntry {
+                username: username.clone(),
+                domain: domain.clone(),
+                password: "secret".to_string(),
+            };
+
+            let request = uac.build_register_request(&dialog, &user);
+
+            // From header
+            let from = request.headers.get("From").expect("From header must exist");
+            let expected_from = format!("<sip:{}@{}>;tag={}", username, domain, from_tag);
+            prop_assert_eq!(&from, &expected_from, "From header mismatch");
+
+            // To header
+            let to = request.headers.get("To").expect("To header must exist");
+            let expected_to = format!("<sip:{}@{}>", username, domain);
+            prop_assert_eq!(&to, &expected_to, "To header mismatch");
+
+            // Call-ID
+            let cid = request.headers.get("Call-ID").expect("Call-ID header must exist");
+            prop_assert_eq!(&cid, &call_id, "Call-ID mismatch");
+
+            // CSeq (REGISTER)
+            let cseq_hdr = request.headers.get("CSeq").expect("CSeq header must exist");
+            let expected_cseq = format!("{} REGISTER", cseq);
+            prop_assert_eq!(&cseq_hdr, &expected_cseq, "CSeq mismatch");
+
+            // Max-Forwards
+            let mf = request.headers.get("Max-Forwards").expect("Max-Forwards header must exist");
+            prop_assert_eq!(mf, "70".to_string(), "Max-Forwards mismatch");
+
+            // Content-Length
+            let cl = request.headers.get("Content-Length").expect("Content-Length header must exist");
+            prop_assert_eq!(cl, "0".to_string(), "Content-Length mismatch");
+
+            // Request URI: sip:domain (not sip:user@domain)
+            let expected_uri = format!("sip:{}", domain);
+            prop_assert_eq!(&request.request_uri, &expected_uri, "Request URI mismatch");
+
+            // Via branch value: must start with z9hG4bK magic cookie
+            let via = request.headers.get("Via").expect("Via header must exist");
+            let branch = extract_via_branch(&via);
+            prop_assert!(
+                branch.starts_with("z9hG4bK"),
+                "Via branch must start with z9hG4bK magic cookie, got: {}",
+                branch
+            );
+        }
+    }
+
+    // ===== Bug condition exploration property tests (Property 3: Branch Uniqueness) =====
+    // **Validates: Requirements 1.5, 2.5**
+    //
+    // These tests assert that different transactions within the same dialog produce
+    // different branch values. On unfixed code they will FAIL, proving the branch
+    // collision bug exists: branch is derived solely from Call-ID, ignoring CSeq/method.
+
+    /// Generate a pair of distinct CSeq numbers for proptest
+    fn arb_distinct_cseq_pair() -> impl Strategy<Value = (u32, u32)> {
+        (arb_cseq(), arb_cseq())
+            .prop_filter("cseq1 must differ from cseq2", |(a, b)| a != b)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Bug condition exploration: different transactions (INVITE vs BYE) within the
+        /// same dialog must produce different branch values.
+        /// On unfixed code this FAILS because branch = z9hG4bK + call_id[..16],
+        /// which is identical for all transactions sharing the same Call-ID.
+        #[test]
+        fn pbt_branch_uniqueness_invite_vs_bye(
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+            local_addr in arb_socket_addr(),
+            (cseq1, cseq2) in arb_distinct_cseq_pair(),
+        ) {
+            // Build an INVITE request
+            let invite = build_reinvite_request_static(
+                &call_id, &from_tag, Some("remote-tag"), cseq1, local_addr,
+            );
+            // Build a BYE request with the same Call-ID but different CSeq
+            let bye = build_bye_request_static(
+                &call_id, &from_tag, Some("remote-tag"), cseq2, local_addr,
+            );
+
+            let invite_via = invite.headers.get("Via").expect("INVITE Via header must exist");
+            let bye_via = bye.headers.get("Via").expect("BYE Via header must exist");
+
+            let invite_branch = extract_via_branch(&invite_via);
+            let bye_branch = extract_via_branch(&bye_via);
+
+            // Different transactions MUST have different branch values (RFC 3261)
+            prop_assert_ne!(
+                invite_branch, bye_branch,
+                "Branch collision: INVITE (CSeq {}) and BYE (CSeq {}) produced the same branch '{}' for Call-ID '{}'",
+                cseq1, cseq2, invite_branch, call_id
+            );
+        }
+    }
 
     /// Mock transport that records all sent messages for verification.
     struct MockTransport {
@@ -919,6 +1419,7 @@ mod tests {
     fn test_uac_config_default() {
         let config = UacConfig::default();
         assert_eq!(config.proxy_addr, test_addr());
+        assert_eq!(config.local_addr, test_addr());
         assert_eq!(config.call_duration, Duration::from_secs(3));
         assert_eq!(config.dialog_timeout, Duration::from_secs(32));
     }
@@ -927,10 +1428,12 @@ mod tests {
     fn test_uac_config_custom() {
         let config = UacConfig {
             proxy_addr: "10.0.0.1:5080".parse().unwrap(),
+            local_addr: "10.0.0.2:5070".parse().unwrap(),
             call_duration: Duration::from_secs(10),
             dialog_timeout: Duration::from_secs(60),
         };
         assert_eq!(config.proxy_addr.port(), 5080);
+        assert_eq!(config.local_addr.port(), 5070);
         assert_eq!(config.call_duration, Duration::from_secs(10));
     }
 

@@ -342,7 +342,7 @@ sequenceDiagram
 1. WHEN JSON設定ファイルパスが位置引数として指定された場合、THE 設定マネージャ SHALL ファイルを読み込み、設定構造体にデシリアライズする
 2. WHEN 設定ファイルが指定されない場合、THE 設定マネージャ SHALL デフォルト設定値を使用する
 3. WHEN 設定値が不正な場合、THE 設定マネージャ SHALL 具体的なエラーメッセージを表示して起動を中止する
-4. THE 設定マネージャ SHALL 以下のパラメータを設定可能とする：proxy_host、proxy_port、uac_host、uac_port、uas_host、uas_port、target_cps、max_dialogs、duration、scenario、pattern、call_duration、health_check_timeout、health_check_retries、shutdown_timeout、uac_port_count、uas_port_count、bg_register_count、builtin_proxy_enabled、builtin_proxy_host、builtin_proxy_port、auth_enabled、auth_username、auth_password、auth_realm
+4. THE 設定マネージャ SHALL 以下のパラメータを設定可能とする：proxy_host、proxy_port、uac_host、uac_port、uas_host、uas_port、target_cps、max_dialogs、duration、scenario、pattern、call_duration、health_check_timeout、health_check_retries、shutdown_timeout、uac_port_count、uas_port_count、bg_register_count、auth_enabled、auth_realm
 5. THE 設定マネージャ SHALL ステップアップモード設定（initial_cps、max_cps、step_size、step_duration、error_threshold）を設定可能とする
 6. THE 設定マネージャ SHALL 二分探索モード設定（initial_cps、step_size、step_duration、error_threshold、convergence_threshold、cooldown_duration）を設定可能とする
 7. FOR ALL 有効な設定構造体について、JSONにシリアライズしてからデシリアライズした結果は元の構造体と等価である（ラウンドトリップ特性）
@@ -770,7 +770,7 @@ impl Orchestrator {
 
 #### 11. 設定マネージャ (`config`)
 
-JSON設定ファイルの読み込みとバリデーション。`serde`を使用する。認証用のusername/passwordは`Config`や`BuiltinProxyConfig`から廃止し、`users_file`フィールドで`UserPool`を参照する。
+JSON設定ファイルの読み込みとバリデーション。`serde`を使用する。認証用のユーザ情報は`users_file`フィールドで`UserPool`を参照する。
 
 ```rust
 pub struct Config {
@@ -792,7 +792,6 @@ pub struct Config {
     pub uac_port_count: u16,
     pub uas_port_count: u16,
     pub bg_register_count: u32,
-    pub builtin_proxy: Option<BuiltinProxyConfig>,
     pub users_file: Option<String>,  // users.jsonファイルパス（auth/proxyのusername/passwordを置換）
     pub auth_enabled: bool,
     pub auth_realm: String,
@@ -800,16 +799,6 @@ pub struct Config {
     pub step_up: Option<StepUpConfig>,
     pub binary_search: Option<BinarySearchConfig>,
 }
-
-pub struct BuiltinProxyConfig {
-    pub enabled: bool,
-    pub host: String,
-    pub port: u16,
-    pub auth_enabled: bool,
-    pub auth_realm: String,
-    // auth_username/auth_password は廃止 → UserPoolで一元管理
-}
-// AuthConfig は廃止 → UserPoolで一元管理
 ```
 
 #### 12. CLIエントリポイント (`cli`)
