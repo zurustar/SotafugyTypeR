@@ -105,6 +105,7 @@ impl Orchestrator {
         let target_cps = self.config.target_cps;
         let duration = Duration::from_secs(self.config.duration);
         let pattern = LoadPattern::new(self.config.pattern.clone());
+        let send_interval = calculate_send_interval(target_cps);
 
         let start = Instant::now();
         let mut calls_sent: u64 = 0;
@@ -130,8 +131,8 @@ impl Orchestrator {
                 }
             }
 
-            // Sleep briefly to avoid busy-waiting
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Dynamic interval based on target CPS (Requirements: 9.3)
+            tokio::time::sleep(send_interval).await;
         }
 
         let finished_at = chrono_now();
@@ -348,6 +349,7 @@ impl Orchestrator {
         let pattern = LoadPattern::new(PatternConfig::Sustained {
             duration_secs: duration.as_secs(),
         });
+        let send_interval = calculate_send_interval(cps);
 
         let start = Instant::now();
         let mut calls_sent: u64 = 0;
@@ -373,7 +375,8 @@ impl Orchestrator {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Dynamic interval based on target CPS (Requirements: 9.3)
+            tokio::time::sleep(send_interval).await;
         }
 
         let snap = self.stats.snapshot();
@@ -515,6 +518,34 @@ fn build_experiment_result(
         started_at: started_at.to_string(),
         finished_at: finished_at.to_string(),
         steps,
+    }
+}
+
+/// Calculate the send interval based on target CPS.
+///
+/// Uses `interval_us = 1_000_000 / target_cps` with:
+/// - Minimum floor: 1ms (prevents busy-waiting at very high CPS)
+/// - Maximum cap: 100ms (ensures responsiveness at very low CPS)
+/// - Edge cases: cps <= 0 returns max interval (100ms)
+///
+/// Requirements: 9.3
+pub fn calculate_send_interval(target_cps: f64) -> Duration {
+    const MIN_INTERVAL: Duration = Duration::from_millis(1);
+    const MAX_INTERVAL: Duration = Duration::from_millis(100);
+
+    if target_cps <= 0.0 {
+        return MAX_INTERVAL;
+    }
+
+    let interval_us = (1_000_000.0 / target_cps) as u64;
+    let interval = Duration::from_micros(interval_us);
+
+    if interval < MIN_INTERVAL {
+        MIN_INTERVAL
+    } else if interval > MAX_INTERVAL {
+        MAX_INTERVAL
+    } else {
+        interval
     }
 }
 
@@ -2065,5 +2096,69 @@ mod tests {
                 result
             );
         }
+    }
+
+    // ===== calculate_send_interval tests =====
+    // Requirements: 9.3 - コール送信ループの動的間隔調整
+
+    #[test]
+    fn test_calculate_send_interval_normal_cps() {
+        // 100 CPS → 1_000_000 / 100 = 10_000 us = 10ms
+        let interval = calculate_send_interval(100.0);
+        assert_eq!(interval, Duration::from_micros(10_000));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_low_cps_capped_at_max() {
+        // 5 CPS → 1_000_000 / 5 = 200_000 us = 200ms → capped at 100ms
+        let interval = calculate_send_interval(5.0);
+        assert_eq!(interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_high_cps_floored_at_min() {
+        // 10_000_000 CPS → 1_000_000 / 10_000_000 ≈ 0.1 us → floored at 1ms
+        let interval = calculate_send_interval(10_000_000.0);
+        assert_eq!(interval, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_zero_cps_returns_max() {
+        let interval = calculate_send_interval(0.0);
+        assert_eq!(interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_negative_cps_returns_max() {
+        let interval = calculate_send_interval(-10.0);
+        assert_eq!(interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_one_cps() {
+        // 1 CPS → 1_000_000 / 1 = 1_000_000 us = 1000ms → capped at 100ms
+        let interval = calculate_send_interval(1.0);
+        assert_eq!(interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_exact_min_boundary() {
+        // 1000 CPS → 1_000_000 / 1000 = 1000 us = 1ms (exactly the min)
+        let interval = calculate_send_interval(1000.0);
+        assert_eq!(interval, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_exact_max_boundary() {
+        // 10 CPS → 1_000_000 / 10 = 100_000 us = 100ms (exactly the max)
+        let interval = calculate_send_interval(10.0);
+        assert_eq!(interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_calculate_send_interval_between_boundaries() {
+        // 50 CPS → 1_000_000 / 50 = 20_000 us = 20ms (between 1ms and 100ms)
+        let interval = calculate_send_interval(50.0);
+        assert_eq!(interval, Duration::from_micros(20_000));
     }
 }

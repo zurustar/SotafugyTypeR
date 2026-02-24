@@ -24,3 +24,8 @@ target
 # Added by cargo
 
 /target
+
+/.kiro/specs
+
+# Benchmark result logs
+result.json

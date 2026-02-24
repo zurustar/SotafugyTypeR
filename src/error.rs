@@ -22,6 +22,10 @@ pub enum SipLoadTestError {
     ShutdownTimeout,
     #[error("Max dialogs reached: {0}")]
     MaxDialogsReached(usize),
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(String),
+    #[error("Max transactions reached: {0}")]
+    MaxTransactionsReached(usize),
 }
 
 #[cfg(test)]
@@ -96,6 +100,30 @@ mod tests {
     fn shutdown_timeout_display() {
         let err = SipLoadTestError::ShutdownTimeout;
         assert_eq!(err.to_string(), "Shutdown timeout");
+    }
+
+    #[test]
+    fn transaction_not_found_display() {
+        let err = SipLoadTestError::TransactionNotFound("tx-abc123".to_string());
+        assert_eq!(err.to_string(), "Transaction not found: tx-abc123");
+    }
+
+    #[test]
+    fn max_transactions_reached_display() {
+        let err = SipLoadTestError::MaxTransactionsReached(1000);
+        assert_eq!(err.to_string(), "Max transactions reached: 1000");
+    }
+
+    #[test]
+    fn transaction_not_found_matches_pattern() {
+        let err = SipLoadTestError::TransactionNotFound("branch-001".to_string());
+        assert!(matches!(err, SipLoadTestError::TransactionNotFound(ref s) if s == "branch-001"));
+    }
+
+    #[test]
+    fn max_transactions_reached_matches_pattern() {
+        let err = SipLoadTestError::MaxTransactionsReached(500);
+        assert!(matches!(err, SipLoadTestError::MaxTransactionsReached(500)));
     }
 
     #[test]

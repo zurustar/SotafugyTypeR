@@ -1,7 +1,9 @@
 // SIP message data model
 
+use smallvec::SmallVec;
+
 /// SIP method types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Method {
     Register,
     Invite,
@@ -19,10 +21,33 @@ pub struct Header {
     pub value: String,
 }
 
+/// Frequent SIP header types for cache lookup
+enum FrequentHeader {
+    Via,
+    From,
+    To,
+    CallId,
+    CSeq,
+    ContentLength,
+}
+
 /// Collection of SIP headers
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Headers {
     entries: Vec<Header>,
+    // 頻出ヘッダへの高速アクセス用キャッシュ
+    via_indices: SmallVec<[usize; 4]>,
+    from_idx: Option<usize>,
+    to_idx: Option<usize>,
+    call_id_idx: Option<usize>,
+    cseq_idx: Option<usize>,
+    content_length_idx: Option<usize>,
+}
+
+impl PartialEq for Headers {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
 }
 
 impl Headers {
@@ -30,19 +55,115 @@ impl Headers {
     pub fn new() -> Self {
         Headers {
             entries: Vec::new(),
+            via_indices: SmallVec::new(),
+            from_idx: None,
+            to_idx: None,
+            call_id_idx: None,
+            cseq_idx: None,
+            content_length_idx: None,
+        }
+    }
+
+    /// Check if a header name is a frequent header and return its cache kind
+    #[inline]
+    fn cache_kind(name: &str) -> Option<FrequentHeader> {
+        if name.eq_ignore_ascii_case("via") {
+            Some(FrequentHeader::Via)
+        } else if name.eq_ignore_ascii_case("from") {
+            Some(FrequentHeader::From)
+        } else if name.eq_ignore_ascii_case("to") {
+            Some(FrequentHeader::To)
+        } else if name.eq_ignore_ascii_case("call-id") {
+            Some(FrequentHeader::CallId)
+        } else if name.eq_ignore_ascii_case("cseq") {
+            Some(FrequentHeader::CSeq)
+        } else if name.eq_ignore_ascii_case("content-length") {
+            Some(FrequentHeader::ContentLength)
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild the entire cache from entries (used after complex mutations)
+    fn rebuild_cache(&mut self) {
+        self.via_indices.clear();
+        self.from_idx = None;
+        self.to_idx = None;
+        self.call_id_idx = None;
+        self.cseq_idx = None;
+        self.content_length_idx = None;
+        for (i, h) in self.entries.iter().enumerate() {
+            match Self::cache_kind(&h.name) {
+                Some(FrequentHeader::Via) => self.via_indices.push(i),
+                Some(FrequentHeader::From) if self.from_idx.is_none() => self.from_idx = Some(i),
+                Some(FrequentHeader::To) if self.to_idx.is_none() => self.to_idx = Some(i),
+                Some(FrequentHeader::CallId) if self.call_id_idx.is_none() => self.call_id_idx = Some(i),
+                Some(FrequentHeader::CSeq) if self.cseq_idx.is_none() => self.cseq_idx = Some(i),
+                Some(FrequentHeader::ContentLength) if self.content_length_idx.is_none() => self.content_length_idx = Some(i),
+                _ => {}
+            }
         }
     }
 
     /// Get the first header value matching the name (case-insensitive)
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| h.value.as_str())
+        // Check cache first for frequent headers
+        match Self::cache_kind(name) {
+            Some(FrequentHeader::Via) => {
+                if let Some(&idx) = self.via_indices.first() {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            Some(FrequentHeader::From) => {
+                if let Some(idx) = self.from_idx {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            Some(FrequentHeader::To) => {
+                if let Some(idx) = self.to_idx {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            Some(FrequentHeader::CallId) => {
+                if let Some(idx) = self.call_id_idx {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            Some(FrequentHeader::CSeq) => {
+                if let Some(idx) = self.cseq_idx {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            Some(FrequentHeader::ContentLength) => {
+                if let Some(idx) = self.content_length_idx {
+                    return Some(self.entries[idx].value.as_str());
+                }
+                return None;
+            }
+            None => {
+                // Fallback to linear search for non-frequent headers
+                self.entries
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name))
+                    .map(|h| h.value.as_str())
+            }
+        }
     }
 
     /// Get all header values matching the name (case-insensitive)
     pub fn get_all(&self, name: &str) -> Vec<&str> {
+        // For Via, use cached indices for fast access
+        if let Some(FrequentHeader::Via) = Self::cache_kind(name) {
+            return self.via_indices.iter()
+                .map(|&idx| self.entries[idx].value.as_str())
+                .collect();
+        }
+        // For other headers, linear search (most single-value headers)
         self.entries
             .iter()
             .filter(|h| h.name.eq_ignore_ascii_case(name))
@@ -53,24 +174,33 @@ impl Headers {
     /// Set a header value, replacing any existing headers with the same name
     pub fn set(&mut self, name: &str, value: String) {
         self.remove(name);
-        self.entries.push(Header {
-            name: name.to_string(),
-            value,
-        });
+        self.add(name, value);
     }
 
     /// Add a header value without removing existing headers with the same name
     pub fn add(&mut self, name: &str, value: String) {
+        let idx = self.entries.len();
         self.entries.push(Header {
             name: name.to_string(),
             value,
         });
+        // Update cache for the newly added entry
+        match Self::cache_kind(name) {
+            Some(FrequentHeader::Via) => self.via_indices.push(idx),
+            Some(FrequentHeader::From) if self.from_idx.is_none() => self.from_idx = Some(idx),
+            Some(FrequentHeader::To) if self.to_idx.is_none() => self.to_idx = Some(idx),
+            Some(FrequentHeader::CallId) if self.call_id_idx.is_none() => self.call_id_idx = Some(idx),
+            Some(FrequentHeader::CSeq) if self.cseq_idx.is_none() => self.cseq_idx = Some(idx),
+            Some(FrequentHeader::ContentLength) if self.content_length_idx.is_none() => self.content_length_idx = Some(idx),
+            _ => {}
+        }
     }
 
     /// Remove all headers matching the name (case-insensitive)
     pub fn remove(&mut self, name: &str) {
         self.entries
             .retain(|h| !h.name.eq_ignore_ascii_case(name));
+        self.rebuild_cache();
     }
 
     /// Remove only the first header matching the name (case-insensitive)
@@ -81,6 +211,7 @@ impl Headers {
             .position(|h| h.name.eq_ignore_ascii_case(name))
         {
             self.entries.remove(pos);
+            self.rebuild_cache();
         }
     }
 
@@ -94,6 +225,7 @@ impl Headers {
                 value,
             },
         );
+        self.rebuild_cache();
     }
 
     /// Get the underlying entries
@@ -172,7 +304,13 @@ pub mod generators {
 
     /// Strategy for generating a Headers collection (0..8 headers)
     pub fn arb_headers() -> impl Strategy<Value = Headers> {
-        proptest::collection::vec(arb_header(), 0..8).prop_map(|entries| Headers { entries })
+        proptest::collection::vec(arb_header(), 0..8).prop_map(|entries| {
+            let mut headers = Headers::new();
+            for h in entries {
+                headers.add(&h.name, h.value);
+            }
+            headers
+        })
     }
 
     /// Strategy for generating an optional body
@@ -622,6 +760,236 @@ mod tests {
             headers.add(&name, value);
             headers.remove(&name);
             prop_assert_eq!(headers.get(&name), None);
+        }
+    }
+
+    // --- Unit tests: Headers index cache ---
+
+    #[test]
+    fn test_cache_get_via_uses_cache() {
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060".to_string());
+        headers.add("From", "<sip:alice@example.com>".to_string());
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.2:5060".to_string());
+        // get() should return the first Via via cache
+        assert_eq!(headers.get("Via"), Some("SIP/2.0/UDP 10.0.0.1:5060"));
+        assert_eq!(headers.get("via"), Some("SIP/2.0/UDP 10.0.0.1:5060"));
+    }
+
+    #[test]
+    fn test_cache_get_from_to_callid_cseq_cl() {
+        let mut headers = Headers::new();
+        headers.add("From", "<sip:alice@example.com>".to_string());
+        headers.add("To", "<sip:bob@example.com>".to_string());
+        headers.add("Call-ID", "abc123@host".to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+        headers.add("Content-Length", "0".to_string());
+
+        assert_eq!(headers.get("From"), Some("<sip:alice@example.com>"));
+        assert_eq!(headers.get("from"), Some("<sip:alice@example.com>"));
+        assert_eq!(headers.get("To"), Some("<sip:bob@example.com>"));
+        assert_eq!(headers.get("to"), Some("<sip:bob@example.com>"));
+        assert_eq!(headers.get("Call-ID"), Some("abc123@host"));
+        assert_eq!(headers.get("call-id"), Some("abc123@host"));
+        assert_eq!(headers.get("CSeq"), Some("1 INVITE"));
+        assert_eq!(headers.get("cseq"), Some("1 INVITE"));
+        assert_eq!(headers.get("Content-Length"), Some("0"));
+        assert_eq!(headers.get("content-length"), Some("0"));
+    }
+
+    #[test]
+    fn test_cache_non_frequent_header_fallback() {
+        let mut headers = Headers::new();
+        headers.add("X-Custom", "custom-value".to_string());
+        // Non-frequent headers should still work via linear search fallback
+        assert_eq!(headers.get("X-Custom"), Some("custom-value"));
+        assert_eq!(headers.get("x-custom"), Some("custom-value"));
+    }
+
+    #[test]
+    fn test_cache_set_updates_cache() {
+        let mut headers = Headers::new();
+        headers.add("From", "old-from".to_string());
+        headers.set("From", "new-from".to_string());
+        assert_eq!(headers.get("From"), Some("new-from"));
+        assert_eq!(headers.get_all("From").len(), 1);
+    }
+
+    #[test]
+    fn test_cache_remove_clears_cache() {
+        let mut headers = Headers::new();
+        headers.add("Via", "via1".to_string());
+        headers.add("From", "from-val".to_string());
+        headers.add("Via", "via2".to_string());
+        headers.remove("Via");
+        assert_eq!(headers.get("Via"), None);
+        // From should still be accessible
+        assert_eq!(headers.get("From"), Some("from-val"));
+    }
+
+    #[test]
+    fn test_cache_remove_first_updates_via_indices() {
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP proxy:5060".to_string());
+        headers.add("Via", "SIP/2.0/UDP uac:5060".to_string());
+        headers.remove_first("Via");
+        assert_eq!(headers.get("Via"), Some("SIP/2.0/UDP uac:5060"));
+        assert_eq!(headers.get_all("Via").len(), 1);
+    }
+
+    #[test]
+    fn test_cache_insert_at_shifts_indices() {
+        let mut headers = Headers::new();
+        headers.add("From", "alice".to_string());
+        headers.add("To", "bob".to_string());
+        // Insert Via at position 0 — should shift From (idx 0→1) and To (idx 1→2)
+        headers.insert_at(0, "Via", "proxy-via".to_string());
+        assert_eq!(headers.get("Via"), Some("proxy-via"));
+        assert_eq!(headers.get("From"), Some("alice"));
+        assert_eq!(headers.get("To"), Some("bob"));
+    }
+
+    #[test]
+    fn test_cache_insert_at_with_cached_header() {
+        let mut headers = Headers::new();
+        headers.add("Via", "first-via".to_string());
+        headers.add("From", "alice".to_string());
+        // Insert CSeq at position 1 — should shift From (idx 1→2)
+        headers.insert_at(1, "CSeq", "1 INVITE".to_string());
+        assert_eq!(headers.get("Via"), Some("first-via"));
+        assert_eq!(headers.get("CSeq"), Some("1 INVITE"));
+        assert_eq!(headers.get("From"), Some("alice"));
+    }
+
+    #[test]
+    fn test_cache_remove_non_cached_preserves_cache() {
+        let mut headers = Headers::new();
+        headers.add("Via", "via-val".to_string());
+        headers.add("X-Custom", "custom".to_string());
+        headers.add("From", "from-val".to_string());
+        headers.remove("X-Custom");
+        // Cached headers should still be accessible after removing non-cached header
+        assert_eq!(headers.get("Via"), Some("via-val"));
+        assert_eq!(headers.get("From"), Some("from-val"));
+    }
+
+    #[test]
+    fn test_cache_multiple_operations_sequence() {
+        let mut headers = Headers::new();
+        headers.add("Via", "via1".to_string());
+        headers.add("From", "alice".to_string());
+        headers.add("To", "bob".to_string());
+        headers.add("Call-ID", "call1".to_string());
+
+        // Set overwrites
+        headers.set("From", "charlie".to_string());
+        assert_eq!(headers.get("From"), Some("charlie"));
+
+        // Add another Via
+        headers.add("Via", "via2".to_string());
+        assert_eq!(headers.get("Via"), Some("via1"));
+        assert_eq!(headers.get_all("Via").len(), 2);
+
+        // Remove all Via
+        headers.remove("Via");
+        assert_eq!(headers.get("Via"), None);
+
+        // Insert Via at beginning
+        headers.insert_at(0, "Via", "via-new".to_string());
+        assert_eq!(headers.get("Via"), Some("via-new"));
+        assert_eq!(headers.get("Call-ID"), Some("call1"));
+    }
+
+    // --- Property test: Headers index cache consistency (Property 2) ---
+
+    /// Helper: linear search through entries (ground truth, no cache)
+    fn linear_search_get<'a>(headers: &'a Headers, name: &str) -> Option<&'a str> {
+        headers.entries().iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    /// Helper: linear search get_all through entries (ground truth, no cache)
+    fn linear_search_get_all<'a>(headers: &'a Headers, name: &str) -> Vec<&'a str> {
+        headers.entries().iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+            .collect()
+    }
+
+    /// Operation enum for generating arbitrary sequences of header mutations
+    #[derive(Debug, Clone)]
+    enum HeaderOp {
+        Add(String, String),
+        Set(String, String),
+        Remove(String),
+        RemoveFirst(String),
+        InsertAt(usize, String, String),
+    }
+
+    /// Strategy for generating header names that include frequent headers
+    fn arb_header_name() -> BoxedStrategy<String> {
+        prop_oneof![
+            3 => Just("Via".to_string()),
+            2 => Just("From".to_string()),
+            2 => Just("To".to_string()),
+            2 => Just("Call-ID".to_string()),
+            2 => Just("CSeq".to_string()),
+            2 => Just("Content-Length".to_string()),
+            1 => "[A-Za-z][A-Za-z0-9-]{0,10}".prop_map(|s| s),
+        ].boxed()
+    }
+
+    /// Strategy for generating a single header operation
+    fn arb_header_op() -> BoxedStrategy<HeaderOp> {
+        let value = "[^\r\n]{1,30}";
+        prop_oneof![
+            (arb_header_name(), value).prop_map(|(n, v)| HeaderOp::Add(n, v)),
+            (arb_header_name(), value).prop_map(|(n, v)| HeaderOp::Set(n, v)),
+            arb_header_name().prop_map(HeaderOp::Remove),
+            arb_header_name().prop_map(HeaderOp::RemoveFirst),
+            (0..20usize, arb_header_name(), value).prop_map(|(i, n, v)| HeaderOp::InsertAt(i, n, v)),
+        ].boxed()
+    }
+
+    // **Validates: Requirements 1.2**
+    // Property 2: 任意のHeaders操作列に対して、get()がキャッシュ使用時と線形探索時で同一結果を返す
+    proptest! {
+        #[test]
+        fn prop_headers_index_cache_consistency(ops in proptest::collection::vec(arb_header_op(), 1..30)) {
+            let mut headers = Headers::new();
+
+            // Apply all operations
+            for op in &ops {
+                match op {
+                    HeaderOp::Add(name, value) => headers.add(name, value.clone()),
+                    HeaderOp::Set(name, value) => headers.set(name, value.clone()),
+                    HeaderOp::Remove(name) => headers.remove(name),
+                    HeaderOp::RemoveFirst(name) => headers.remove_first(name),
+                    HeaderOp::InsertAt(idx, name, value) => headers.insert_at(*idx, name, value.clone()),
+                }
+            }
+
+            // Verify cache consistency for all frequent headers
+            let frequent_names = ["Via", "From", "To", "Call-ID", "CSeq", "Content-Length"];
+            for name in &frequent_names {
+                let cached_result = headers.get(name);
+                let linear_result = linear_search_get(&headers, name);
+                prop_assert_eq!(
+                    cached_result, linear_result,
+                    "get() mismatch for '{}': cached={:?}, linear={:?}",
+                    name, cached_result, linear_result
+                );
+            }
+
+            // Also verify get_all for Via (the only multi-value cached header)
+            let cached_all = headers.get_all("Via");
+            let linear_all = linear_search_get_all(&headers, "Via");
+            prop_assert_eq!(
+                cached_all.clone(), linear_all.clone(),
+                "get_all('Via') mismatch: cached={:?}, linear={:?}",
+                cached_all, linear_all
+            );
         }
     }
 }

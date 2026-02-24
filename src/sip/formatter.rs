@@ -16,31 +16,62 @@ fn method_to_str(method: &Method) -> &str {
     }
 }
 
-/// Format a SipMessage into RFC 3261 compliant bytes.
-///
-/// Request format:
-///   METHOD Request-URI SIP/2.0\r\n
-///   Header-Name: Header-Value\r\n
-///   ...\r\n
-///   \r\n
-///   [body]
-///
-/// Response format:
-///   SIP/2.0 Status-Code Reason-Phrase\r\n
-///   Header-Name: Header-Value\r\n
-///   ...\r\n
-///   \r\n
-///   [body]
-pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Estimate the output size of a formatted SIP message to pre-allocate buffer.
+/// The estimate is intentionally slightly over to avoid re-allocation.
+pub fn estimate_message_size(msg: &SipMessage) -> usize {
+    match msg {
+        SipMessage::Request(req) => {
+            // Request line: METHOD SP URI SP VERSION CRLF
+            let mut size = method_to_str(&req.method).len() + 1
+                + req.request_uri.len() + 1
+                + req.version.len() + 2;
+            // Headers
+            for h in req.headers.entries() {
+                // "Name: Value\r\n"
+                size += h.name.len() + 2 + h.value.len() + 2;
+            }
+            // Possible auto-added Content-Length header (up to ~25 bytes)
+            size += 32;
+            // Empty line separator
+            size += 2;
+            // Body
+            if let Some(body) = &req.body {
+                size += body.len();
+            }
+            size
+        }
+        SipMessage::Response(resp) => {
+            // Status line: VERSION SP STATUS_CODE SP REASON CRLF
+            let mut size = resp.version.len() + 1
+                + 3 + 1  // status code is always 3 digits for SIP
+                + resp.reason_phrase.len() + 2;
+            // Headers
+            for h in resp.headers.entries() {
+                size += h.name.len() + 2 + h.value.len() + 2;
+            }
+            // Possible auto-added Content-Length header
+            size += 32;
+            // Empty line separator
+            size += 2;
+            // Body
+            if let Some(body) = &resp.body {
+                size += body.len();
+            }
+            size
+        }
+    }
+}
 
+/// Format a SIP message into an existing buffer (for buffer reuse).
+/// The buffer is NOT cleared — caller should clear it if reuse is intended.
+pub fn format_into(buf: &mut Vec<u8>, msg: &SipMessage) {
     match msg {
         SipMessage::Request(req) => {
             // Request line
             buf.extend_from_slice(method_to_str(&req.method).as_bytes());
-            buf.extend_from_slice(b" ");
+            buf.push(b' ');
             buf.extend_from_slice(req.request_uri.as_bytes());
-            buf.extend_from_slice(b" ");
+            buf.push(b' ');
             buf.extend_from_slice(req.version.as_bytes());
             buf.extend_from_slice(b"\r\n");
 
@@ -57,9 +88,10 @@ pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
                 if !body.is_empty() {
                     // Add Content-Length if not already present
                     if req.headers.get("Content-Length").is_none() {
-                        buf.extend_from_slice(
-                            format!("Content-Length: {}\r\n", body.len()).as_bytes(),
-                        );
+                        buf.extend_from_slice(b"Content-Length: ");
+                        let mut itoa_buf = itoa::Buffer::new();
+                        buf.extend_from_slice(itoa_buf.format(body.len()).as_bytes());
+                        buf.extend_from_slice(b"\r\n");
                     }
                     buf.extend_from_slice(b"\r\n");
                     buf.extend_from_slice(body);
@@ -73,9 +105,10 @@ pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
         SipMessage::Response(resp) => {
             // Status line
             buf.extend_from_slice(resp.version.as_bytes());
-            buf.extend_from_slice(b" ");
-            buf.extend_from_slice(resp.status_code.to_string().as_bytes());
-            buf.extend_from_slice(b" ");
+            buf.push(b' ');
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.extend_from_slice(itoa_buf.format(resp.status_code).as_bytes());
+            buf.push(b' ');
             buf.extend_from_slice(resp.reason_phrase.as_bytes());
             buf.extend_from_slice(b"\r\n");
 
@@ -92,9 +125,10 @@ pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
                 if !body.is_empty() {
                     // Add Content-Length if not already present
                     if resp.headers.get("Content-Length").is_none() {
-                        buf.extend_from_slice(
-                            format!("Content-Length: {}\r\n", body.len()).as_bytes(),
-                        );
+                        buf.extend_from_slice(b"Content-Length: ");
+                        let mut itoa_buf = itoa::Buffer::new();
+                        buf.extend_from_slice(itoa_buf.format(body.len()).as_bytes());
+                        buf.extend_from_slice(b"\r\n");
                     }
                     buf.extend_from_slice(b"\r\n");
                     buf.extend_from_slice(body);
@@ -106,7 +140,27 @@ pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
             }
         }
     }
+}
 
+/// Format a SipMessage into RFC 3261 compliant bytes.
+///
+/// Request format:
+///   METHOD Request-URI SIP/2.0\r\n
+///   Header-Name: Header-Value\r\n
+///   ...\r\n
+///   \r\n
+///   [body]
+///
+/// Response format:
+///   SIP/2.0 Status-Code Reason-Phrase\r\n
+///   Header-Name: Header-Value\r\n
+///   ...\r\n
+///   \r\n
+///   [body]
+pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
+    let estimated_size = estimate_message_size(msg);
+    let mut buf = Vec::with_capacity(estimated_size);
+    format_into(&mut buf, msg);
     buf
 }
 
@@ -470,6 +524,155 @@ mod tests {
     // Feature: sip-load-tester, Property 1: SIPメッセージのラウンドトリップ
     // **Validates: Requirements 1.1, 1.2, 1.4, 1.5**
 
+    // --- Unit tests: estimate_message_size ---
+
+    #[test]
+    fn test_estimate_message_size_request_no_body() {
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060".to_string());
+        headers.add("Call-ID", "abc123@10.0.0.1".to_string());
+
+        let msg = SipMessage::Request(SipRequest {
+            method: Method::Register,
+            request_uri: "sip:registrar.example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: None,
+        });
+
+        let estimated = estimate_message_size(&msg);
+        let actual = format_sip_message(&msg).len();
+        // Estimate should be >= actual (no under-allocation)
+        assert!(
+            estimated >= actual,
+            "estimate {} should be >= actual {}",
+            estimated,
+            actual
+        );
+    }
+
+    #[test]
+    fn test_estimate_message_size_response_with_body() {
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\n".to_vec();
+        let mut headers = Headers::new();
+        headers.add("CSeq", "1 INVITE".to_string());
+
+        let msg = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: Some(body),
+        });
+
+        let estimated = estimate_message_size(&msg);
+        let actual = format_sip_message(&msg).len();
+        assert!(
+            estimated >= actual,
+            "estimate {} should be >= actual {}",
+            estimated,
+            actual
+        );
+    }
+
+    // --- Unit tests: format_into ---
+
+    #[test]
+    fn test_format_into_produces_same_output_as_format_sip_message() {
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060".to_string());
+        headers.add("From", "<sip:alice@example.com>;tag=1234".to_string());
+        headers.add("To", "<sip:alice@example.com>".to_string());
+        headers.add("Call-ID", "abc123@10.0.0.1".to_string());
+        headers.add("CSeq", "1 REGISTER".to_string());
+
+        let msg = SipMessage::Request(SipRequest {
+            method: Method::Register,
+            request_uri: "sip:registrar.example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: None,
+        });
+
+        let expected = format_sip_message(&msg);
+        let mut buf = Vec::new();
+        format_into(&mut buf, &msg);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_format_into_response_with_body() {
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\n".to_vec();
+        let mut headers = Headers::new();
+        headers.add("CSeq", "1 INVITE".to_string());
+
+        let msg = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: Some(body),
+        });
+
+        let expected = format_sip_message(&msg);
+        let mut buf = Vec::new();
+        format_into(&mut buf, &msg);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_format_into_reuses_buffer() {
+        let msg1 = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 100,
+            reason_phrase: "Trying".to_string(),
+            headers: Headers::new(),
+            body: None,
+        });
+
+        let msg2 = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers: Headers::new(),
+            body: None,
+        });
+
+        let mut buf = Vec::new();
+
+        // First message
+        format_into(&mut buf, &msg1);
+        assert_eq!(buf, format_sip_message(&msg1));
+
+        // Reuse buffer for second message
+        buf.clear();
+        format_into(&mut buf, &msg2);
+        assert_eq!(buf, format_sip_message(&msg2));
+    }
+
+    #[test]
+    fn test_format_into_status_code_direct_write() {
+        // Test various status codes to ensure itoa produces correct output
+        for code in [100u16, 180, 200, 401, 404, 486, 500, 503] {
+            let msg = SipMessage::Response(SipResponse {
+                version: "SIP/2.0".to_string(),
+                status_code: code,
+                reason_phrase: "Test".to_string(),
+                headers: Headers::new(),
+                body: None,
+            });
+
+            let expected = format_sip_message(&msg);
+            let mut buf = Vec::new();
+            format_into(&mut buf, &msg);
+            assert_eq!(
+                buf, expected,
+                "Mismatch for status code {}",
+                code
+            );
+        }
+    }
+
     use crate::sip::message::generators::{arb_sip_message, arb_sip_request, arb_sip_response};
     use proptest::prelude::*;
 
@@ -569,6 +772,18 @@ mod tests {
             let bytes = format_sip_message(&normalized);
             let parsed = parse_msg(&bytes).expect("format→parse should succeed for any valid SipResponse");
             prop_assert_eq!(normalized, parsed);
+        }
+
+        /// Feature: performance-bottleneck-optimization, Property 3: フォーマッター出力のバイト列一致
+        /// For any valid SipMessage, format_into(&mut buf, msg) produces byte-identical output
+        /// to format_sip_message(msg).
+        /// **Validates: Requirements 2.3**
+        #[test]
+        fn prop_format_into_byte_identical(msg in arb_sip_message()) {
+            let expected = format_sip_message(&msg);
+            let mut buf = Vec::new();
+            format_into(&mut buf, &msg);
+            prop_assert_eq!(buf, expected, "format_into must produce byte-identical output to format_sip_message");
         }
     }
 }

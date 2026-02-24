@@ -14,16 +14,23 @@ path = "src/bin/sip_proxy.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 nom = "7"
+smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 dashmap = "6"
 thiserror = "2"
 anyhow = "1"
 md-5 = "0.10"
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+itoa = "1"
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sip_benchmarks"
+harness = false

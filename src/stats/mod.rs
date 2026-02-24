@@ -7,14 +7,19 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Thread-safe statistics collector using atomic operations.
+/// Latency recording uses sharded buffers to reduce lock contention
+/// under high concurrency.
 pub struct StatsCollector {
     total_calls: AtomicU64,
     successful_calls: AtomicU64,
     failed_calls: AtomicU64,
     active_dialogs: AtomicU64,
     auth_failures: AtomicU64,
+    retransmissions: AtomicU64,
+    transaction_timeouts: AtomicU64,
     status_codes: DashMap<u16, AtomicU64>,
-    latencies: Mutex<Vec<Duration>>,
+    latency_shards: Vec<Mutex<Vec<Duration>>>,
+    shard_count: usize,
     start_time: Instant,
 }
 
@@ -27,6 +32,8 @@ pub struct StatsSnapshot {
     pub failed_calls: u64,
     pub active_dialogs: u64,
     pub auth_failures: u64,
+    pub retransmissions: u64,
+    pub transaction_timeouts: u64,
     pub cps: f64,
     pub latency_p50: Duration,
     pub latency_p90: Duration,
@@ -39,14 +46,23 @@ pub struct StatsSnapshot {
 impl StatsCollector {
     /// Create a new StatsCollector.
     pub fn new() -> Self {
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let latency_shards = (0..shard_count)
+            .map(|_| Mutex::new(Vec::new()))
+            .collect();
         Self {
             total_calls: AtomicU64::new(0),
             successful_calls: AtomicU64::new(0),
             failed_calls: AtomicU64::new(0),
             active_dialogs: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
+            retransmissions: AtomicU64::new(0),
+            transaction_timeouts: AtomicU64::new(0),
             status_codes: DashMap::new(),
-            latencies: Mutex::new(Vec::new()),
+            latency_shards,
+            shard_count,
             start_time: Instant::now(),
         }
     }
@@ -59,7 +75,19 @@ impl StatsCollector {
             .entry(status_code)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
-        self.latencies.lock().unwrap().push(latency);
+        let idx = self.shard_index();
+        self.latency_shards[idx].lock().unwrap().push(latency);
+    }
+
+    /// Select a shard based on the current thread ID.
+    fn shard_index(&self) -> usize {
+        let thread_id = std::thread::current().id();
+        let hash = format!("{:?}", thread_id);
+        let mut h: usize = 0;
+        for b in hash.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(b as usize);
+        }
+        h % self.shard_count
     }
 
     /// Record a failed call.
@@ -83,6 +111,16 @@ impl StatsCollector {
         self.active_dialogs.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Record a retransmission event (client or server).
+    pub fn record_retransmission(&self) {
+        self.retransmissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a transaction timeout event.
+    pub fn record_transaction_timeout(&self) {
+        self.transaction_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a snapshot of the current statistics.
     pub fn snapshot(&self) -> StatsSnapshot {
         let now = Instant::now();
@@ -94,8 +132,13 @@ impl StatsCollector {
             0.0
         };
 
-        let latencies = self.latencies.lock().unwrap();
-        let (p50, p90, p95, p99) = calculate_percentiles(&latencies);
+        // Merge all shards into a single Vec for percentile calculation
+        let mut all_latencies = Vec::new();
+        for shard in &self.latency_shards {
+            let guard = shard.lock().unwrap();
+            all_latencies.extend_from_slice(&guard);
+        }
+        let (p50, p90, p95, p99) = calculate_percentiles(&all_latencies);
 
         let mut status_map = HashMap::new();
         for entry in self.status_codes.iter() {
@@ -109,6 +152,8 @@ impl StatsCollector {
             failed_calls: self.failed_calls.load(Ordering::Relaxed),
             active_dialogs: self.active_dialogs.load(Ordering::Relaxed),
             auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            retransmissions: self.retransmissions.load(Ordering::Relaxed),
+            transaction_timeouts: self.transaction_timeouts.load(Ordering::Relaxed),
             cps,
             latency_p50: p50,
             latency_p90: p90,
@@ -466,6 +511,164 @@ mod tests {
         // nearest-rank: idx = ceil(0.5 * 3) - 1 = 2 - 1 = 1 -> 20ms
         assert_eq!(snap.latency_p50, Duration::from_millis(20));
     }
+    #[test]
+    fn test_sharding_produces_same_percentiles_as_single_vec() {
+        // Record latencies via the sharded StatsCollector and verify
+        // the snapshot percentiles match calculate_percentiles on the same data
+        let latencies_ms: Vec<u64> = (1..=100).collect();
+        let durations: Vec<Duration> = latencies_ms.iter().map(|&ms| Duration::from_millis(ms)).collect();
+
+        let collector = StatsCollector::new();
+        for &d in &durations {
+            collector.record_call(200, d);
+        }
+
+        let snap = collector.snapshot();
+        let (exp_p50, exp_p90, exp_p95, exp_p99) = calculate_percentiles(&durations);
+
+        assert_eq!(snap.latency_p50, exp_p50);
+        assert_eq!(snap.latency_p90, exp_p90);
+        assert_eq!(snap.latency_p95, exp_p95);
+        assert_eq!(snap.latency_p99, exp_p99);
+    }
+
+    #[test]
+    fn test_sharding_concurrent_latency_correctness() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let collector = Arc::new(StatsCollector::new());
+        let num_threads = 8;
+        let calls_per_thread = 100;
+        let mut handles = vec![];
+
+        for t in 0..num_threads {
+            let c = Arc::clone(&collector);
+            handles.push(thread::spawn(move || {
+                for i in 0..calls_per_thread {
+                    let ms = (t * calls_per_thread + i + 1) as u64;
+                    c.record_call(200, Duration::from_millis(ms));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.total_calls, (num_threads * calls_per_thread) as u64);
+        assert_eq!(snap.successful_calls, (num_threads * calls_per_thread) as u64);
+
+        // Verify percentiles are computed from all latencies merged
+        // Build the expected full set
+        let mut all_latencies: Vec<Duration> = Vec::new();
+        for t in 0..num_threads {
+            for i in 0..calls_per_thread {
+                let ms = (t * calls_per_thread + i + 1) as u64;
+                all_latencies.push(Duration::from_millis(ms));
+            }
+        }
+        let (exp_p50, exp_p90, exp_p95, exp_p99) = calculate_percentiles(&all_latencies);
+
+        assert_eq!(snap.latency_p50, exp_p50);
+        assert_eq!(snap.latency_p90, exp_p90);
+        assert_eq!(snap.latency_p95, exp_p95);
+        assert_eq!(snap.latency_p99, exp_p99);
+    }
+
+    #[test]
+    fn test_shard_count_is_positive() {
+        let collector = StatsCollector::new();
+        assert!(collector.shard_count > 0, "shard_count must be at least 1");
+    }
+
+    #[test]
+    fn test_new_collector_has_zero_retransmissions_and_timeouts() {
+        let collector = StatsCollector::new();
+        let snap = collector.snapshot();
+        assert_eq!(snap.retransmissions, 0);
+        assert_eq!(snap.transaction_timeouts, 0);
+    }
+
+    #[test]
+    fn test_record_retransmission_increments_counter() {
+        let collector = StatsCollector::new();
+        collector.record_retransmission();
+        collector.record_retransmission();
+        collector.record_retransmission();
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.retransmissions, 3);
+        // Ensure other counters are unaffected
+        assert_eq!(snap.transaction_timeouts, 0);
+        assert_eq!(snap.total_calls, 0);
+    }
+
+    #[test]
+    fn test_record_transaction_timeout_increments_counter() {
+        let collector = StatsCollector::new();
+        collector.record_transaction_timeout();
+        collector.record_transaction_timeout();
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.transaction_timeouts, 2);
+        // Ensure other counters are unaffected
+        assert_eq!(snap.retransmissions, 0);
+        assert_eq!(snap.total_calls, 0);
+    }
+
+    #[test]
+    fn test_retransmission_and_timeout_independent() {
+        let collector = StatsCollector::new();
+        collector.record_retransmission();
+        collector.record_retransmission();
+        collector.record_transaction_timeout();
+        collector.record_retransmission();
+        collector.record_transaction_timeout();
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.retransmissions, 3);
+        assert_eq!(snap.transaction_timeouts, 2);
+    }
+
+    #[test]
+    fn test_concurrent_retransmission_and_timeout() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let collector = Arc::new(StatsCollector::new());
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let c = Arc::clone(&collector);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    c.record_retransmission();
+                }
+            }));
+        }
+
+        for _ in 0..5 {
+            let c = Arc::clone(&collector);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    c.record_transaction_timeout();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.retransmissions, 1000);
+        assert_eq!(snap.transaction_timeouts, 500);
+    }
+
+
+
 
     // ===== Property-Based Tests =====
 
@@ -502,6 +705,44 @@ mod tests {
         }
     }
 
+    // Feature: performance-bottleneck-optimization, Property 8: パーセンタイル計算の等価性
+    // **Validates: Requirements 6.4**
+    proptest! {
+        #[test]
+        fn prop_percentile_sharding_equivalence(
+            latencies_ms in vec(0u64..10_000, 0..100),
+            shard_count in 2usize..16
+        ) {
+            let durations: Vec<Duration> = latencies_ms.iter()
+                .map(|&ms| Duration::from_millis(ms))
+                .collect();
+
+            // Split durations across N shards using round-robin
+            let mut shards: Vec<Vec<Duration>> = (0..shard_count)
+                .map(|_| Vec::new())
+                .collect();
+            for (i, &d) in durations.iter().enumerate() {
+                shards[i % shard_count].push(d);
+            }
+
+            // Merge all shards back into a single Vec
+            let mut merged: Vec<Duration> = Vec::new();
+            for shard in &shards {
+                merged.extend_from_slice(shard);
+            }
+
+            // Compute percentiles on both original and merged
+            let original_percentiles = calculate_percentiles(&durations);
+            let merged_percentiles = calculate_percentiles(&merged);
+
+            prop_assert_eq!(
+                original_percentiles, merged_percentiles,
+                "Percentiles differ: original {:?} vs merged {:?} (len={}, shards={})",
+                original_percentiles, merged_percentiles, durations.len(), shard_count
+            );
+        }
+    }
+
     // Feature: sip-load-tester, Property 10: ステータスコード別集計
     // **Validates: Requirements 11.3**
     proptest! {
@@ -533,6 +774,45 @@ mod tests {
                 prop_assert_eq!(actual, *count,
                     "count mismatch for status code {}", code);
             }
+        }
+    }
+
+    // Feature: sip-transaction-layer, Property 15: 再送・タイムアウト時の統計記録
+    // **Validates: Requirements 11.1, 11.2, 11.3, 8.4**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_retransmission_and_timeout_stats(
+            retransmit_count in 0u64..500,
+            timeout_count in 0u64..500,
+        ) {
+            let collector = StatsCollector::new();
+
+            for _ in 0..retransmit_count {
+                collector.record_retransmission();
+            }
+            for _ in 0..timeout_count {
+                collector.record_transaction_timeout();
+            }
+
+            let snap = collector.snapshot();
+
+            prop_assert_eq!(
+                snap.retransmissions, retransmit_count,
+                "retransmissions mismatch: expected {}, got {}",
+                retransmit_count, snap.retransmissions
+            );
+            prop_assert_eq!(
+                snap.transaction_timeouts, timeout_count,
+                "transaction_timeouts mismatch: expected {}, got {}",
+                timeout_count, snap.transaction_timeouts
+            );
+
+            // Verify independence: retransmission/timeout recording
+            // does not affect other counters
+            prop_assert_eq!(snap.total_calls, 0);
+            prop_assert_eq!(snap.failed_calls, 0);
         }
     }
 }

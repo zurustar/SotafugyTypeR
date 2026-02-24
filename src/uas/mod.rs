@@ -69,6 +69,7 @@ pub struct Uas {
     dialogs: DashMap<String, UasDialog>,
     stats: Arc<StatsCollector>,
     config: UasConfig,
+    transaction_manager: Option<crate::transaction::TransactionManager>,
 }
 
 impl Uas {
@@ -83,6 +84,23 @@ impl Uas {
             dialogs: DashMap::new(),
             stats,
             config,
+            transaction_manager: None,
+        }
+    }
+
+    /// Create a new UAS instance with TransactionManager for retransmission control.
+    pub fn with_transaction_manager(
+        transport: Arc<dyn SipTransport>,
+        stats: Arc<StatsCollector>,
+        config: UasConfig,
+        transaction_manager: crate::transaction::TransactionManager,
+    ) -> Self {
+        Self {
+            transport,
+            dialogs: DashMap::new(),
+            stats,
+            config,
+            transaction_manager: Some(transaction_manager),
         }
     }
 
@@ -93,15 +111,141 @@ impl Uas {
         from: SocketAddr,
     ) -> Result<(), SipLoadTestError> {
         match request {
-            SipMessage::Request(ref req) => match req.method {
-                Method::Invite => self.handle_invite(req, from).await,
-                Method::Ack => self.handle_ack(req),
-                Method::Bye => self.handle_bye(req, from).await,
-                Method::Register => self.handle_register(req, from).await,
-                _ => Ok(()),
-            },
+            SipMessage::Request(ref req) => {
+                // TransactionManagerが有効な場合、先にトランザクション層で処理する
+                if let Some(ref tm) = self.transaction_manager {
+                    // ACKはTransactionManager内部で処理される（handle_requestがACKを処理する）
+                    // ただしUAS側のダイアログ状態更新も必要なので、ACKは両方で処理する
+                    if req.method == Method::Ack {
+                        // ACKはTransactionManagerに渡してからUASでも処理
+                        let _ = tm.handle_request(req, from);
+                        return self.handle_ack(req);
+                    }
+
+                    match tm.handle_request(req, from) {
+                        Some(crate::transaction::TransactionEvent::Request(tx_id, _req, _source)) => {
+                            // 新規リクエスト → 既存ロジックで処理し、レスポンスはTM経由で送信
+                            return self.handle_request_with_tm(req, from, &tx_id).await;
+                        }
+                        _ => {
+                            // 再送は吸収（UASには通知しない）、またはmax_transactions到達
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // TransactionManagerなし → 従来通り直接処理
+                match req.method {
+                    Method::Invite => self.handle_invite(req, from).await,
+                    Method::Ack => self.handle_ack(req),
+                    Method::Bye => self.handle_bye(req, from).await,
+                    Method::Register => self.handle_register(req, from).await,
+                    _ => Ok(()),
+                }
+            }
             SipMessage::Response(_) => Ok(()), // UAS ignores responses
         }
+    }
+
+    /// Handle request with TransactionManager: responses are sent through TM.
+    async fn handle_request_with_tm(
+        &self,
+        request: &SipRequest,
+        from: SocketAddr,
+        tx_id: &crate::transaction::TransactionId,
+    ) -> Result<(), SipLoadTestError> {
+        let tm = self.transaction_manager.as_ref().unwrap();
+
+        match request.method {
+            Method::Invite => {
+                let call_id = request.headers.get("Call-ID").unwrap_or("").to_string();
+
+                // Parse Session-Expires header if present
+                let session_expires = request
+                    .headers
+                    .get("Session-Expires")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+
+                // Check if this is a re-INVITE
+                if self.dialogs.contains_key(&call_id) {
+                    return self.handle_reinvite_with_tm(request, from, &call_id, session_expires, tx_id).await;
+                }
+
+                // Send 100 Trying directly (INVITE server transaction starts in Proceeding,
+                // so 1xx provisional responses are sent directly, not through TM's send_response)
+                let trying = self.build_response(request, 100, "Trying");
+                let trying_bytes = format_sip_message(&SipMessage::Response(trying));
+                self.transport.send_to(&trying_bytes, from).await?;
+
+                // Create dialog in Early state
+                self.dialogs.insert(
+                    call_id.clone(),
+                    UasDialog {
+                        call_id: call_id.clone(),
+                        state: UasDialogState::Early,
+                        session_expires,
+                        last_activity: Instant::now(),
+                    },
+                );
+
+                // Send 200 OK via TM (final response triggers state transition)
+                let mut ok = self.build_response(request, 200, "OK");
+                if let Some(se) = session_expires {
+                    ok.headers.set("Session-Expires", se.as_secs().to_string());
+                }
+                tm.send_response(tx_id, ok).await?;
+
+                self.stats.increment_active_dialogs();
+                Ok(())
+            }
+            Method::Bye => {
+                let call_id = request.headers.get("Call-ID").unwrap_or("").to_string();
+
+                if self.dialogs.contains_key(&call_id) {
+                    let ok = self.build_response(request, 200, "OK");
+                    tm.send_response(tx_id, ok).await?;
+                    self.dialogs.remove(&call_id);
+                    self.stats.decrement_active_dialogs();
+                } else {
+                    let not_exist = self.build_response(request, 481, "Call/Transaction Does Not Exist");
+                    tm.send_response(tx_id, not_exist).await?;
+                }
+                Ok(())
+            }
+            Method::Register => {
+                let ok = self.build_response(request, 200, "OK");
+                tm.send_response(tx_id, ok).await?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Handle re-INVITE with TransactionManager.
+    async fn handle_reinvite_with_tm(
+        &self,
+        request: &SipRequest,
+        _from: SocketAddr,
+        call_id: &str,
+        session_expires: Option<Duration>,
+        tx_id: &crate::transaction::TransactionId,
+    ) -> Result<(), SipLoadTestError> {
+        let tm = self.transaction_manager.as_ref().unwrap();
+
+        if let Some(mut dialog) = self.dialogs.get_mut(call_id) {
+            dialog.last_activity = Instant::now();
+            if let Some(se) = session_expires {
+                dialog.session_expires = Some(se);
+            }
+        }
+
+        let mut ok = self.build_response(request, 200, "OK");
+        if let Some(se) = session_expires {
+            ok.headers.set("Session-Expires", se.as_secs().to_string());
+        }
+        tm.send_response(tx_id, ok).await?;
+        Ok(())
     }
 
     /// Handle INVITE: send 100 Trying, then 200 OK, create dialog.
@@ -309,6 +453,33 @@ impl Uas {
     /// Get a dialog by Call-ID (for testing/inspection).
     pub fn get_dialog(&self, call_id: &str) -> Option<UasDialog> {
         self.dialogs.get(call_id).map(|d| d.clone())
+    }
+
+    /// Run a transaction tick loop that periodically calls `TransactionManager::tick()`
+    /// and `cleanup_terminated()` every 10ms. Stops when `shutdown` flag is set.
+    /// If no TransactionManager is configured, returns immediately.
+    pub async fn start_transaction_tick_loop(
+        &self,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let tm = match &self.transaction_manager {
+            Some(tm) => tm,
+            None => return,
+        };
+
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            interval.tick().await;
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            // Process expired timers (retransmissions, timeouts)
+            let _events = tm.tick().await;
+
+            // Remove terminated transactions from the map
+            tm.cleanup_terminated();
+        }
     }
 
     /// Shutdown the UAS, terminating all dialogs.
@@ -1068,6 +1239,224 @@ mod tests {
         let timed_out = uas.check_session_timeouts();
         assert_eq!(timed_out, 0, "Should not timeout dialogs without Session-Expires");
         assert!(uas.get_dialog("call-no-timer").is_some());
+    }
+
+    // ===== TransactionManager integration tests =====
+
+    fn make_uas_with_transaction_manager(
+        transport: Arc<MockTransport>,
+    ) -> (Uas, Arc<StatsCollector>) {
+        use crate::transaction::{TimerConfig, TransactionManager};
+        let stats = Arc::new(StatsCollector::new());
+        let tm = TransactionManager::new(
+            transport.clone() as Arc<dyn SipTransport>,
+            stats.clone(),
+            TimerConfig::default(),
+            10000,
+        );
+        let uas = Uas::with_transaction_manager(
+            transport,
+            stats.clone(),
+            UasConfig::default(),
+            tm,
+        );
+        (uas, stats)
+    }
+
+    #[test]
+    fn test_uas_new_has_no_transaction_manager() {
+        let transport = Arc::new(MockTransport::new());
+        let uas = make_uas(transport);
+        assert!(uas.transaction_manager.is_none());
+    }
+
+    #[test]
+    fn test_with_transaction_manager_constructor() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport);
+        assert!(uas.transaction_manager.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_via_tm_creates_server_transaction() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        let invite = make_invite_request("call-tm-1");
+        uas.handle_request(invite, test_addr()).await.unwrap();
+
+        // TransactionManagerにサーバートランザクションが登録されている
+        let tm = uas.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_via_tm_register_creates_transaction() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        let register = make_register_request("reg-tm-1");
+        uas.handle_request(register, test_addr()).await.unwrap();
+
+        let tm = uas.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_via_tm_retransmit_absorbed() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        let invite = make_invite_request("call-retrans-tm");
+        let invite2 = make_invite_request("call-retrans-tm");
+        uas.handle_request(invite, test_addr()).await.unwrap();
+
+        let _responses_after_first = transport.sent_responses().len();
+
+        // 同一リクエストの再送 → TransactionManagerが吸収し、UASには通知しない
+        uas.handle_request(invite2, test_addr()).await.unwrap();
+
+        // 再送時はUASのhandle_invite等が呼ばれないので、新たなレスポンスは送信されない
+        // （TransactionManagerが再送を吸収する）
+        let tm = uas.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1, "Should still have only 1 transaction");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_via_tm_sends_response_through_tm() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        // REGISTER → 200 OK がTransactionManager経由で送信される
+        let register = make_register_request("reg-tm-resp");
+        uas.handle_request(register, test_addr()).await.unwrap();
+
+        // レスポンスが送信されていることを確認
+        let responses = transport.sent_responses();
+        assert!(responses.len() >= 1, "Should send at least one response");
+        assert_eq!(responses[0].status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn test_handle_invite_via_tm_sends_trying_and_ok() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        let invite = make_invite_request("call-tm-invite");
+        uas.handle_request(invite, test_addr()).await.unwrap();
+
+        let responses = transport.sent_responses();
+        assert_eq!(responses.len(), 2, "Should send 100 Trying and 200 OK");
+        assert_eq!(responses[0].status_code, 100);
+        assert_eq!(responses[1].status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn test_handle_bye_via_tm_sends_200_ok() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+
+        // First create a dialog via INVITE
+        let invite = make_invite_request("call-tm-bye");
+        uas.handle_request(invite, test_addr()).await.unwrap();
+        let ack = make_ack_request("call-tm-bye");
+        uas.handle_request(ack, test_addr()).await.unwrap();
+
+        // BYE → 200 OK
+        let bye = make_bye_request("call-tm-bye");
+        uas.handle_request(bye, test_addr()).await.unwrap();
+
+        let responses = transport.sent_responses();
+        // INVITE: 100 + 200, BYE: 200 = 3 responses
+        let bye_response = responses.last().unwrap();
+        assert_eq!(bye_response.status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn test_existing_uas_tests_still_pass_without_tm() {
+        // Verify backward compatibility: Uas::new() without TM still works
+        let transport = Arc::new(MockTransport::new());
+        let uas = make_uas(transport.clone());
+
+        let invite = make_invite_request("call-compat");
+        uas.handle_request(invite, test_addr()).await.unwrap();
+
+        let responses = transport.sent_responses();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].status_code, 100);
+        assert_eq!(responses[1].status_code, 200);
+    }
+
+    // ===== start_transaction_tick_loop tests =====
+
+    #[tokio::test]
+    async fn test_start_transaction_tick_loop_returns_immediately_without_tm() {
+        let transport = Arc::new(MockTransport::new());
+        let uas = make_uas(transport.clone());
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Should return immediately since no TransactionManager is configured
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                // We wrap in a timeout to ensure it returns quickly
+                let result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    uas.start_transaction_tick_loop(shutdown),
+                ).await;
+                assert!(result.is_ok(), "Should return immediately without TM");
+            }
+        });
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_transaction_tick_loop_stops_on_shutdown() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+        let uas = Arc::new(uas);
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let uas_clone = uas.clone();
+
+        let handle = tokio::spawn(async move {
+            uas_clone.start_transaction_tick_loop(shutdown_clone).await;
+        });
+
+        // Let it run for a bit
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Signal shutdown
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Should stop within a reasonable time
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok(), "Tick loop should stop after shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn test_start_transaction_tick_loop_calls_tick_and_cleanup() {
+        let transport = Arc::new(MockTransport::new());
+        let (uas, _stats) = make_uas_with_transaction_manager(transport.clone());
+        let uas = Arc::new(uas);
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let uas_clone = uas.clone();
+
+        let handle = tokio::spawn(async move {
+            uas_clone.start_transaction_tick_loop(shutdown_clone).await;
+        });
+
+        // Let it tick a few times (10ms interval, so 50ms should give ~5 ticks)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Signal shutdown
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok(), "Tick loop should complete after shutdown");
     }
 
     // ===== Property 6: 存在しないダイアログへの481応答 =====

@@ -97,6 +97,10 @@ pub struct Config {
     pub mode: RunMode,
     pub step_up: Option<StepUpConfig>,
     pub binary_search: Option<BinarySearchConfig>,
+    pub transaction_t1_ms: Option<u64>,
+    pub transaction_t2_ms: Option<u64>,
+    pub transaction_t4_ms: Option<u64>,
+    pub max_transactions: Option<usize>,
 }
 
 impl Default for Config {
@@ -126,6 +130,10 @@ impl Default for Config {
             mode: RunMode::default(),
             step_up: None,
             binary_search: None,
+            transaction_t1_ms: None,
+            transaction_t2_ms: None,
+            transaction_t4_ms: None,
+            max_transactions: None,
         }
     }
 }
@@ -457,7 +465,27 @@ pub mod generators {
                 )
             },
         )
-        .prop_map(|(net, core, timing, opt, mode, step_up, binary_search)| Config {
+        .prop_flat_map(|(net, core, timing, opt, mode, step_up, binary_search)| {
+            // Transaction config fields
+            let tx_t1 = proptest::option::of(100u64..2000);
+            let tx_t2 = proptest::option::of(1000u64..10000);
+            let tx_t4 = proptest::option::of(1000u64..10000);
+            let tx_max = proptest::option::of(1usize..100000);
+            (
+                Just(net),
+                Just(core),
+                Just(timing),
+                Just(opt),
+                Just(mode),
+                Just(step_up),
+                Just(binary_search),
+                tx_t1,
+                tx_t2,
+                tx_t4,
+                tx_max,
+            )
+        })
+        .prop_map(|(net, core, timing, opt, mode, step_up, binary_search, tx_t1, tx_t2, tx_t4, tx_max)| Config {
             proxy_host: net.0,
             proxy_port: net.1,
             uac_host: net.2,
@@ -482,6 +510,10 @@ pub mod generators {
             mode,
             step_up,
             binary_search,
+            transaction_t1_ms: tx_t1,
+            transaction_t2_ms: tx_t2,
+            transaction_t4_ms: tx_t4,
+            max_transactions: tx_max,
         })
     }
     /// Strategy for generating valid ProxyServerConfig
@@ -1602,6 +1634,52 @@ mod tests {
             }
             prop_assert!(config.validate().is_err());
         }
+    }
+
+    // ===== トランザクション設定フィールドテスト (Task 13.1) =====
+    // Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 12.4
+
+    #[test]
+    fn test_config_transaction_fields_default_to_none() {
+        let config = Config::default();
+        assert_eq!(config.transaction_t1_ms, None);
+        assert_eq!(config.transaction_t2_ms, None);
+        assert_eq!(config.transaction_t4_ms, None);
+        assert_eq!(config.max_transactions, None);
+    }
+
+    #[test]
+    fn test_config_transaction_fields_serde_roundtrip() {
+        let mut config = Config::default();
+        config.transaction_t1_ms = Some(500);
+        config.transaction_t2_ms = Some(4000);
+        config.transaction_t4_ms = Some(5000);
+        config.max_transactions = Some(10000);
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_config_transaction_fields_backward_compat_missing_fields() {
+        // トランザクションフィールドが存在しないJSONでもデシリアライズが成功し、Noneになること
+        let json = r#"{"target_cps": 10.0}"#;
+        let loaded = load_from_str(json).unwrap();
+        assert_eq!(loaded.transaction_t1_ms, None);
+        assert_eq!(loaded.transaction_t2_ms, None);
+        assert_eq!(loaded.transaction_t4_ms, None);
+        assert_eq!(loaded.max_transactions, None);
+    }
+
+    #[test]
+    fn test_config_transaction_fields_partial_set() {
+        // 一部のトランザクションフィールドのみ設定した場合
+        let json = r#"{"transaction_t1_ms": 250, "max_transactions": 5000}"#;
+        let loaded = load_from_str(json).unwrap();
+        assert_eq!(loaded.transaction_t1_ms, Some(250));
+        assert_eq!(loaded.transaction_t2_ms, None);
+        assert_eq!(loaded.transaction_t4_ms, None);
+        assert_eq!(loaded.max_transactions, Some(5000));
     }
 
     // ===== Property 3: 後方互換性 - builtin_proxy の無視 =====

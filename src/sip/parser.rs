@@ -56,10 +56,9 @@ fn parse_method(method_str: &str) -> Method {
         "BYE" => Method::Bye,
         "OPTIONS" => Method::Options,
         "UPDATE" => Method::Update,
-        other => Method::Other(other.to_string()),
+        other => Method::Other(String::from(other)),
     }
 }
-
 
 /// nom parser: consume a CRLF sequence
 fn crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -123,12 +122,15 @@ fn parse_request(input: &[u8]) -> Result<SipMessage, ParseError> {
 
     let method_str = std::str::from_utf8(method_bytes)
         .map_err(|_| ParseError::new("invalid UTF-8 in method"))?;
-    let request_uri = std::str::from_utf8(uri_bytes)
-        .map_err(|_| ParseError::new("invalid UTF-8 in request URI"))?
-        .to_string();
-    let version = std::str::from_utf8(version_bytes)
-        .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?
-        .to_string();
+    // Use String::from() directly from &str — avoids .to_string() overhead
+    let request_uri = String::from(
+        std::str::from_utf8(uri_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in request URI"))?,
+    );
+    let version = String::from(
+        std::str::from_utf8(version_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?,
+    );
 
     if !version.starts_with("SIP/") {
         return Err(ParseError::new(format!("invalid SIP version: {}", version)));
@@ -141,15 +143,16 @@ fn parse_request(input: &[u8]) -> Result<SipMessage, ParseError> {
 
     let mut headers = Headers::new();
     for (name_bytes, value_bytes) in &raw_headers {
-        let name = std::str::from_utf8(name_bytes)
+        let name_str = std::str::from_utf8(name_bytes)
             .map_err(|_| ParseError::new("invalid UTF-8 in header name"))?
-            .trim()
-            .to_string();
-        let value = std::str::from_utf8(value_bytes)
+            .trim();
+        let value_str = std::str::from_utf8(value_bytes)
             .map_err(|_| ParseError::new("invalid UTF-8 in header value"))?
-            .trim()
-            .to_string();
-        headers.add(&name, value);
+            .trim();
+        // Pass &str directly to add() — avoids intermediate String allocation for name.
+        // add() internally calls name.to_string() only once.
+        // For value, create String::from() directly from trimmed &str.
+        headers.add(name_str, String::from(value_str));
     }
 
     let body = parse_body(remaining, &headers)?;
@@ -168,17 +171,20 @@ fn parse_response(input: &[u8]) -> Result<SipMessage, ParseError> {
     let (remaining, (version_bytes, status_bytes, reason_bytes)) =
         parse_status_line(input).map_err(|e| ParseError::new(format!("invalid status line: {}", e)))?;
 
-    let version = std::str::from_utf8(version_bytes)
-        .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?
-        .to_string();
+    // Use String::from() directly from &str — avoids .to_string() overhead
+    let version = String::from(
+        std::str::from_utf8(version_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?,
+    );
     let status_str = std::str::from_utf8(status_bytes)
         .map_err(|_| ParseError::new("invalid UTF-8 in status code"))?;
     let status_code: u16 = status_str
         .parse()
         .map_err(|_| ParseError::new(format!("invalid status code: {}", status_str)))?;
-    let reason_phrase = std::str::from_utf8(reason_bytes)
-        .map_err(|_| ParseError::new("invalid UTF-8 in reason phrase"))?
-        .to_string();
+    let reason_phrase = String::from(
+        std::str::from_utf8(reason_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in reason phrase"))?,
+    );
 
     if !version.starts_with("SIP/") {
         return Err(ParseError::new(format!("invalid SIP version: {}", version)));
@@ -189,15 +195,15 @@ fn parse_response(input: &[u8]) -> Result<SipMessage, ParseError> {
 
     let mut headers = Headers::new();
     for (name_bytes, value_bytes) in &raw_headers {
-        let name = std::str::from_utf8(name_bytes)
+        let name_str = std::str::from_utf8(name_bytes)
             .map_err(|_| ParseError::new("invalid UTF-8 in header name"))?
-            .trim()
-            .to_string();
-        let value = std::str::from_utf8(value_bytes)
+            .trim();
+        let value_str = std::str::from_utf8(value_bytes)
             .map_err(|_| ParseError::new("invalid UTF-8 in header value"))?
-            .trim()
-            .to_string();
-        headers.add(&name, value);
+            .trim();
+        // Pass &str directly to add() — avoids intermediate String allocation for name.
+        // add() internally calls name.to_string() only once.
+        headers.add(name_str, String::from(value_str));
     }
 
     let body = parse_body(remaining, &headers)?;
@@ -211,7 +217,10 @@ fn parse_response(input: &[u8]) -> Result<SipMessage, ParseError> {
     }))
 }
 
-/// Parse the message body based on Content-Length header
+/// Parse the message body based on Content-Length header.
+///
+/// Optimization: Content-Length=0 returns None immediately without any allocation.
+/// No Content-Length + empty remaining also returns None without allocation.
 fn parse_body(remaining: &[u8], headers: &Headers) -> Result<Option<Vec<u8>>, ParseError> {
     let content_length = headers
         .get("Content-Length")
@@ -223,6 +232,7 @@ fn parse_body(remaining: &[u8], headers: &Headers) -> Result<Option<Vec<u8>>, Pa
         .transpose()?;
 
     match content_length {
+        // Explicit zero-allocation path for Content-Length: 0
         Some(0) => Ok(None),
         Some(len) => {
             if remaining.len() < len {
@@ -236,10 +246,10 @@ fn parse_body(remaining: &[u8], headers: &Headers) -> Result<Option<Vec<u8>>, Pa
             }
         }
         None => {
+            // No Content-Length: return None if no remaining data (zero allocation)
             if remaining.is_empty() {
                 Ok(None)
             } else {
-                // No Content-Length but there's remaining data - treat as body
                 Ok(Some(remaining.to_vec()))
             }
         }
@@ -249,7 +259,67 @@ fn parse_body(remaining: &[u8], headers: &Headers) -> Result<Option<Vec<u8>>, Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sip::formatter::format_sip_message;
+    use crate::sip::message::generators::arb_sip_message;
+    use crate::sip::message::{Headers, SipMessage, SipRequest, SipResponse};
     use proptest::prelude::*;
+
+    // --- Normalization helper for format→parse roundtrip ---
+
+    /// Normalize a SipMessage to account for formatter behavior:
+    /// - Trims header values (parser trims whitespace)
+    /// - Normalizes empty body (Some(vec![]) → None)
+    /// - Adds Content-Length header when body is present and header is missing
+    /// - Trims leading whitespace from reason_phrase (parser consumes leading spaces)
+    fn normalize_for_roundtrip(msg: &SipMessage) -> SipMessage {
+        match msg {
+            SipMessage::Request(req) => {
+                let mut headers = Headers::new();
+                for h in req.headers.entries() {
+                    headers.add(&h.name, h.value.trim().to_string());
+                }
+                let body = match &req.body {
+                    Some(b) if !b.is_empty() => Some(b.clone()),
+                    _ => None,
+                };
+                if let Some(ref b) = body {
+                    if headers.get("Content-Length").is_none() {
+                        headers.add("Content-Length", b.len().to_string());
+                    }
+                }
+                SipMessage::Request(SipRequest {
+                    method: req.method.clone(),
+                    request_uri: req.request_uri.clone(),
+                    version: req.version.clone(),
+                    headers,
+                    body,
+                })
+            }
+            SipMessage::Response(resp) => {
+                let mut headers = Headers::new();
+                for h in resp.headers.entries() {
+                    headers.add(&h.name, h.value.trim().to_string());
+                }
+                let body = match &resp.body {
+                    Some(b) if !b.is_empty() => Some(b.clone()),
+                    _ => None,
+                };
+                if let Some(ref b) = body {
+                    if headers.get("Content-Length").is_none() {
+                        headers.add("Content-Length", b.len().to_string());
+                    }
+                }
+                let reason_phrase = resp.reason_phrase.trim_start().to_string();
+                SipMessage::Response(SipResponse {
+                    version: resp.version.clone(),
+                    status_code: resp.status_code,
+                    reason_phrase,
+                    headers,
+                    body,
+                })
+            }
+        }
+    }
 
     // --- Known SIP methods and "SIP/" prefix for filtering ---
     const KNOWN_METHODS: &[&[u8]] = &[
@@ -355,6 +425,20 @@ mod tests {
         ) {
             let result = parse_sip_message(b"");
             prop_assert!(result.is_err(), "empty input should produce parse error");
+        }
+    }
+
+    // Feature: performance-bottleneck-optimization, Property 1: Format→Parseラウンドトリップ
+    // **Validates: Requirements 1.5, 2.4**
+    proptest! {
+        /// Property 1: 任意の有効なSipMessageに対して、format→parseの結果が元のメッセージと等価
+        #[test]
+        fn prop_format_parse_roundtrip(msg in arb_sip_message()) {
+            let normalized = normalize_for_roundtrip(&msg);
+            let formatted = format_sip_message(&normalized);
+            let parsed = parse_sip_message(&formatted)
+                .expect("format→parse should succeed for any valid SipMessage");
+            prop_assert_eq!(normalized, parsed);
         }
     }
 
@@ -748,5 +832,82 @@ mod tests {
         let err = ParseError::new("test");
         let cloned = err.clone();
         assert_eq!(err, cloned);
+    }
+
+    // --- Unit tests: Zero-copy optimization (Task 3.3) ---
+
+    /// Content-Length: 0 のレスポンスでボディが None であることを確認
+    #[test]
+    fn test_parse_response_content_length_zero_no_body() {
+        let input = b"SIP/2.0 200 OK\r\n\
+                       Content-Length: 0\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       \r\n";
+
+        let result = parse_sip_message(input).unwrap();
+        match result {
+            SipMessage::Response(resp) => {
+                assert!(resp.body.is_none(), "Content-Length: 0 should produce None body");
+                assert_eq!(resp.status_code, 200);
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    /// Content-Length: 0 + 残りデータなしのリクエストでボディが None であることを確認
+    #[test]
+    fn test_parse_request_content_length_zero_no_body_allocation() {
+        let input = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       Content-Length: 0\r\n\
+                       \r\n";
+
+        let result = parse_sip_message(input).unwrap();
+        match result {
+            SipMessage::Request(req) => {
+                assert!(req.body.is_none(), "Content-Length: 0 should produce None body, not empty Vec");
+                // ヘッダが正しくパースされていることも確認
+                assert_eq!(req.headers.get("Via"), Some("SIP/2.0/UDP 10.0.0.1:5060"));
+                assert_eq!(req.headers.get("Content-Length"), Some("0"));
+            }
+            _ => panic!("Expected Request"),
+        }
+    }
+
+    /// パース結果のヘッダ名・値が正しくトリムされていることを確認（最適化後も動作維持）
+    #[test]
+    fn test_parse_header_values_trimmed_after_optimization() {
+        let input = b"REGISTER sip:registrar.example.com SIP/2.0\r\n\
+                       Via:   SIP/2.0/UDP 10.0.0.1:5060  \r\n\
+                       From:  <sip:alice@example.com>;tag=1234  \r\n\
+                       Call-ID:  abc123@10.0.0.1  \r\n\
+                       \r\n";
+
+        let result = parse_sip_message(input).unwrap();
+        match result {
+            SipMessage::Request(req) => {
+                // 値の前後の空白がトリムされていること
+                assert_eq!(req.headers.get("Via"), Some("SIP/2.0/UDP 10.0.0.1:5060"));
+                assert_eq!(req.headers.get("From"), Some("<sip:alice@example.com>;tag=1234"));
+                assert_eq!(req.headers.get("Call-ID"), Some("abc123@10.0.0.1"));
+            }
+            _ => panic!("Expected Request"),
+        }
+    }
+
+    /// Content-Lengthなし + 残りデータなしのレスポンスでボディが None であることを確認
+    #[test]
+    fn test_parse_response_no_content_length_empty_remaining_no_body() {
+        let input = b"SIP/2.0 100 Trying\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       \r\n";
+
+        let result = parse_sip_message(input).unwrap();
+        match result {
+            SipMessage::Response(resp) => {
+                assert!(resp.body.is_none(), "No Content-Length + empty remaining should produce None body");
+            }
+            _ => panic!("Expected Response"),
+        }
     }
 }

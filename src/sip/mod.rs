@@ -10,13 +10,18 @@ use std::hash::SipHasher;
 /// Call-ID、CSeq番号、メソッドのハッシュから`z9hG4bK`プレフィックス付きのbranch値を生成する。
 /// 同一パラメータに対しては常に同一のbranch値を返す（冪等性）。
 pub fn generate_branch(call_id: &str, cseq: u32, method: &str) -> String {
+    use std::fmt::Write;
     #[allow(deprecated)]
     let mut hasher = SipHasher::new();
     call_id.hash(&mut hasher);
     cseq.hash(&mut hasher);
     method.hash(&mut hasher);
     let hash_value = hasher.finish();
-    format!("z9hG4bK{:016x}", hash_value)
+    // "z9hG4bK" (7) + 16 hex chars = 23 chars
+    let mut buf = String::with_capacity(23);
+    buf.push_str("z9hG4bK");
+    write!(buf, "{:016x}", hash_value).unwrap();
+    buf
 }
 
 #[cfg(test)]

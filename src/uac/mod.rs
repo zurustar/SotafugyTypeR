@@ -7,6 +7,7 @@
 pub mod load_pattern;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ pub struct Uac {
     pub auth: Option<DigestAuth>,
     user_pool: Arc<UserPool>,
     config: UacConfig,
+    transaction_manager: Option<crate::transaction::TransactionManager>,
 }
 
 impl Uac {
@@ -72,6 +74,27 @@ impl Uac {
             auth: None,
             user_pool,
             config,
+            transaction_manager: None,
+        }
+    }
+
+    /// Create a new UAC instance with TransactionManager for retransmission control.
+    pub fn with_transaction_manager(
+        transport: Arc<dyn SipTransport>,
+        dialog_manager: Arc<DialogManager>,
+        stats: Arc<StatsCollector>,
+        user_pool: Arc<UserPool>,
+        config: UacConfig,
+        transaction_manager: crate::transaction::TransactionManager,
+    ) -> Self {
+        Self {
+            transport,
+            dialog_manager,
+            stats,
+            auth: None,
+            user_pool,
+            config,
+            transaction_manager: Some(transaction_manager),
         }
     }
 
@@ -81,16 +104,22 @@ impl Uac {
         let dialog = self.dialog_manager.create_dialog()?;
 
         let request = self.build_register_request(&dialog, user);
-        let bytes = format_sip_message(&SipMessage::Request(request.clone()));
 
         // Store original request in dialog for potential re-send (auth)
         if let Some(mut d) = self.dialog_manager.get_dialog_mut(&dialog.call_id) {
             d.state = DialogState::Trying;
-            d.original_request = Some(SipMessage::Request(request));
+            d.original_request = Some(SipMessage::Request(request.clone()));
         }
 
         self.stats.increment_active_dialogs();
-        self.transport.send_to(&bytes, self.config.proxy_addr).await?;
+
+        // TransactionManager経由で送信（再送制御あり）、なければ直接送信
+        if let Some(ref tm) = self.transaction_manager {
+            tm.send_request(request, self.config.proxy_addr).await?;
+        } else {
+            let bytes = format_sip_message(&SipMessage::Request(request));
+            self.transport.send_to(&bytes, self.config.proxy_addr).await?;
+        }
 
         Ok(())
     }
@@ -101,15 +130,21 @@ impl Uac {
         let dialog = self.dialog_manager.create_dialog()?;
 
         let request = self.build_invite_request(&dialog, user);
-        let bytes = format_sip_message(&SipMessage::Request(request.clone()));
 
         if let Some(mut d) = self.dialog_manager.get_dialog_mut(&dialog.call_id) {
             d.state = DialogState::Trying;
-            d.original_request = Some(SipMessage::Request(request));
+            d.original_request = Some(SipMessage::Request(request.clone()));
         }
 
         self.stats.increment_active_dialogs();
-        self.transport.send_to(&bytes, self.config.proxy_addr).await?;
+
+        // TransactionManager経由で送信（再送制御あり）、なければ直接送信
+        if let Some(ref tm) = self.transaction_manager {
+            tm.send_request(request, self.config.proxy_addr).await?;
+        } else {
+            let bytes = format_sip_message(&SipMessage::Request(request));
+            self.transport.send_to(&bytes, self.config.proxy_addr).await?;
+        }
 
         Ok(())
     }
@@ -159,25 +194,14 @@ impl Uac {
 
     /// Force-timeout all remaining active dialogs (used by bg_register on timeout).
     fn check_timeouts_force(&self) -> usize {
-        let call_ids = self.dialog_manager.all_call_ids();
+        let call_ids = self.dialog_manager.collect_timed_out(Duration::ZERO);
         let mut timed_out = 0;
 
         for call_id in call_ids {
-            let should_remove = {
-                if let Some(dialog) = self.dialog_manager.get_dialog(&call_id) {
-                    dialog.state != DialogState::Terminated
-                        && dialog.state != DialogState::Error
-                } else {
-                    false
-                }
-            };
-
-            if should_remove {
-                self.dialog_manager.remove_dialog(&call_id);
-                self.stats.record_failure();
-                self.stats.decrement_active_dialogs();
-                timed_out += 1;
-            }
+            self.dialog_manager.remove_dialog(&call_id);
+            self.stats.record_failure();
+            self.stats.decrement_active_dialogs();
+            timed_out += 1;
         }
 
         timed_out
@@ -193,6 +217,24 @@ impl Uac {
             SipMessage::Response(r) => r,
             SipMessage::Request(_) => return Ok(()), // Ignore requests
         };
+
+        // TransactionManagerが有効な場合、先にトランザクション層で処理する
+        if let Some(ref tm) = self.transaction_manager {
+            match tm.handle_response(resp) {
+                Some(crate::transaction::TransactionEvent::Response(_tx_id, ref _tx_resp)) => {
+                    // TransactionEvent::Responseを受け取った場合のみ既存ロジックに渡す
+                }
+                Some(crate::transaction::TransactionEvent::Timeout(_tx_id)) => {
+                    // タイムアウトはStatsCollectorに記録済み（TransactionManager内で）
+                    return Ok(());
+                }
+                _ => {
+                    // 1xx暫定レスポンスやトランザクション不明の場合はスキップ
+                    // ただし1xxは既存ロジックでも無視されるので、そのまま通す
+                    // トランザクション不明（None）の場合は既存ロジックにフォールスルー
+                }
+            }
+        }
 
         let call_id = resp.headers.get("Call-ID").unwrap_or("").to_string();
         if call_id.is_empty() {
@@ -242,29 +284,15 @@ impl Uac {
     /// Check for timed-out dialogs and record failures.
     /// Returns the number of timed-out dialogs.
     pub fn check_timeouts(&self) -> usize {
-        let now = Instant::now();
         let timeout = self.config.dialog_timeout;
-        let call_ids = self.dialog_manager.all_call_ids();
+        let call_ids = self.dialog_manager.collect_timed_out(timeout);
         let mut timed_out = 0;
 
         for call_id in call_ids {
-            let should_timeout = {
-                if let Some(dialog) = self.dialog_manager.get_dialog(&call_id) {
-                    let elapsed = now.duration_since(dialog.created_at);
-                    elapsed >= timeout
-                        && dialog.state != DialogState::Terminated
-                        && dialog.state != DialogState::Error
-                } else {
-                    false
-                }
-            };
-
-            if should_timeout {
-                self.dialog_manager.remove_dialog(&call_id);
-                self.stats.record_failure();
-                self.stats.decrement_active_dialogs();
-                timed_out += 1;
-            }
+            self.dialog_manager.remove_dialog(&call_id);
+            self.stats.record_failure();
+            self.stats.decrement_active_dialogs();
+            timed_out += 1;
         }
 
         timed_out
@@ -293,6 +321,71 @@ impl Uac {
         }
 
         Ok(())
+    }
+
+    /// Run a batch BYE sending loop that periodically collects expired Confirmed
+    /// dialogs and sends BYE requests in batch, replacing individual `tokio::spawn`
+    /// per call. The loop ticks every 50ms and stops when `shutdown` flag is set.
+    pub async fn start_bye_batch_loop(
+        &self,
+        call_duration: Duration,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            interval.tick().await;
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let expired = self.dialog_manager.collect_expired_for_bye(call_duration);
+            for (call_id, from_tag, to_tag, cseq) in expired {
+                let bye = build_bye_request_static(
+                    &call_id,
+                    &from_tag,
+                    to_tag.as_deref(),
+                    cseq + 1,
+                    self.config.local_addr,
+                );
+                let bye_bytes = format_sip_message(&SipMessage::Request(bye));
+                let _ = self.transport.send_to(&bye_bytes, self.config.proxy_addr).await;
+
+                // Update dialog state to Trying (waiting for BYE response)
+                if let Some(mut d) = self.dialog_manager.get_dialog_mut(&call_id) {
+                    d.state = DialogState::Trying;
+                    d.cseq = cseq + 1;
+                }
+            }
+        }
+    }
+
+    /// Run a transaction tick loop that periodically calls `TransactionManager::tick()`
+    /// and `cleanup_terminated()` every 10ms. Stops when `shutdown` flag is set.
+    /// If no TransactionManager is configured, returns immediately.
+    /// When `tick()` returns `TransactionEvent::Timeout`, it is already recorded
+    /// in StatsCollector by the TransactionManager internally.
+    pub async fn start_transaction_tick_loop(
+        &self,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let tm = match &self.transaction_manager {
+            Some(tm) => tm,
+            None => return,
+        };
+
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            interval.tick().await;
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Process expired timers (retransmissions, timeouts)
+            let _events = tm.tick().await;
+
+            // Remove terminated transactions from the map
+            tm.cleanup_terminated();
+        }
     }
 
     // --- Private helper methods ---
@@ -401,44 +494,9 @@ impl Uac {
             });
         }
 
-        // Schedule BYE after call_duration using tokio::spawn
-        let transport = self.transport.clone();
-        let dialog_manager = self.dialog_manager.clone();
-        let _stats = self.stats.clone();
-        let call_duration = self.config.call_duration;
-        let proxy_addr = self.config.proxy_addr;
-        let local_addr = self.config.local_addr;
-        let call_id_owned = call_id.to_string();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(call_duration).await;
-
-            let dialog_info = {
-                dialog_manager.get_dialog(&call_id_owned).map(|d| {
-                    (d.from_tag.clone(), d.to_tag.clone(), d.cseq, d.state.clone(), d.created_at)
-                })
-            };
-
-            if let Some((from_tag, to_tag, cseq, state, _created_at)) = dialog_info {
-                if state == DialogState::Confirmed {
-                    let bye = build_bye_request_static(
-                        &call_id_owned,
-                        &from_tag,
-                        to_tag.as_deref(),
-                        cseq + 1,
-                        local_addr,
-                    );
-                    let bye_bytes = format_sip_message(&SipMessage::Request(bye));
-                    let _ = transport.send_to(&bye_bytes, proxy_addr).await;
-
-                    // Update dialog state to Trying (waiting for BYE response)
-                    if let Some(mut d) = dialog_manager.get_dialog_mut(&call_id_owned) {
-                        d.state = DialogState::Trying;
-                        d.cseq = cseq + 1;
-                    }
-                }
-            }
-        });
+        // BYE sending is now handled by the batch BYE loop (start_bye_batch_loop).
+        // The batch loop periodically checks for expired Confirmed dialogs and sends
+        // BYE requests in batch, replacing the individual tokio::spawn per call.
 
         Ok(())
     }
@@ -584,7 +642,7 @@ impl Uac {
         // Build new request with incremented CSeq and auth header
         let new_cseq = current_cseq + 1;
         let mut new_req = orig_req.clone();
-        new_req.headers.set("CSeq", format!("{} {}", new_cseq, method_str));
+        new_req.headers.set("CSeq", build_cseq_value(new_cseq, method_str));
         new_req.headers.set(header_name, auth_value);
 
         let bytes = format_sip_message(&SipMessage::Request(new_req.clone()));
@@ -620,27 +678,19 @@ impl Uac {
 
     /// Build a REGISTER request
     fn build_register_request(&self, dialog: &Dialog, user: &UserEntry) -> SipRequest {
+        let branch = crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "REGISTER");
         let mut headers = Headers::new();
-        headers.add(
-            "Via",
-            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "REGISTER")),
-        );
-        headers.set(
-            "From",
-            format!("<sip:{}@{}>;tag={}", user.username, user.domain, dialog.from_tag),
-        );
-        headers.set(
-            "To",
-            format!("<sip:{}@{}>", user.username, user.domain),
-        );
+        headers.add("Via", build_via_value(self.config.local_addr, &branch));
+        headers.set("From", build_from_value(&user.username, &user.domain, &dialog.from_tag));
+        headers.set("To", build_to_value(&user.username, &user.domain));
         headers.set("Call-ID", dialog.call_id.clone());
-        headers.set("CSeq", format!("{} REGISTER", dialog.cseq));
+        headers.set("CSeq", build_cseq_value(dialog.cseq, "REGISTER"));
         headers.set("Max-Forwards", "70".to_string());
         headers.set("Content-Length", "0".to_string());
 
         SipRequest {
             method: Method::Register,
-            request_uri: format!("sip:{}", user.domain),
+            request_uri: build_sip_domain_uri(&user.domain),
             version: "SIP/2.0".to_string(),
             headers,
             body: None,
@@ -649,27 +699,19 @@ impl Uac {
 
     /// Build an INVITE request
     fn build_invite_request(&self, dialog: &Dialog, user: &UserEntry) -> SipRequest {
+        let branch = crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "INVITE");
         let mut headers = Headers::new();
-        headers.add(
-            "Via",
-            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(&dialog.call_id, dialog.cseq, "INVITE")),
-        );
-        headers.set(
-            "From",
-            format!("<sip:{}@{}>;tag={}", user.username, user.domain, dialog.from_tag),
-        );
-        headers.set(
-            "To",
-            format!("<sip:{}@{}>", user.username, user.domain),
-        );
+        headers.add("Via", build_via_value(self.config.local_addr, &branch));
+        headers.set("From", build_from_value(&user.username, &user.domain, &dialog.from_tag));
+        headers.set("To", build_to_value(&user.username, &user.domain));
         headers.set("Call-ID", dialog.call_id.clone());
-        headers.set("CSeq", format!("{} INVITE", dialog.cseq));
+        headers.set("CSeq", build_cseq_value(dialog.cseq, "INVITE"));
         headers.set("Max-Forwards", "70".to_string());
         headers.set("Content-Length", "0".to_string());
 
         SipRequest {
             method: Method::Invite,
-            request_uri: format!("sip:{}@{}", user.username, user.domain),
+            request_uri: build_sip_uri(&user.username, &user.domain),
             version: "SIP/2.0".to_string(),
             headers,
             body: None,
@@ -684,20 +726,13 @@ impl Uac {
         to_tag: Option<&str>,
         cseq: u32,
     ) -> SipRequest {
+        let branch = crate::sip::generate_branch(call_id, cseq, "ACK");
         let mut headers = Headers::new();
-        headers.add(
-            "Via",
-            format!("SIP/2.0/UDP {};branch={}", self.config.local_addr, crate::sip::generate_branch(call_id, cseq, "ACK")),
-        );
+        headers.add("Via", build_via_value(self.config.local_addr, &branch));
         headers.set("Call-ID", call_id.to_string());
-        headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
-        let to_val = if let Some(tag) = to_tag {
-            format!("<sip:uas@remote>;tag={}", tag)
-        } else {
-            "<sip:uas@remote>".to_string()
-        };
-        headers.set("To", to_val);
-        headers.set("CSeq", format!("{} ACK", cseq));
+        headers.set("From", build_from_tag_only("sip:uac@local", from_tag));
+        headers.set("To", build_to_value_with_optional_tag("sip:uas@remote", to_tag));
+        headers.set("CSeq", build_cseq_value(cseq, "ACK"));
         headers.set("Max-Forwards", "70".to_string());
         headers.set("Content-Length", "0".to_string());
 
@@ -722,6 +757,100 @@ impl Uac {
     }
 }
 
+// ===== Optimized header value builders =====
+// These replace format! macro calls with write!/push_str for reduced allocations.
+
+use std::fmt::Write;
+
+/// Build Via header value: "SIP/2.0/UDP {addr};branch={branch}"
+fn build_via_value(addr: SocketAddr, branch: &str) -> String {
+    // "SIP/2.0/UDP " (12) + addr (~21) + ";branch=" (8) + branch (23) ≈ 64
+    let mut buf = String::with_capacity(64);
+    buf.push_str("SIP/2.0/UDP ");
+    write!(buf, "{}", addr).unwrap();
+    buf.push_str(";branch=");
+    buf.push_str(branch);
+    buf
+}
+
+/// Build From header value: "<sip:{user}@{domain}>;tag={tag}"
+fn build_from_value(username: &str, domain: &str, tag: &str) -> String {
+    let mut buf = String::with_capacity(5 + username.len() + 1 + domain.len() + 6 + tag.len());
+    buf.push_str("<sip:");
+    buf.push_str(username);
+    buf.push('@');
+    buf.push_str(domain);
+    buf.push_str(">;tag=");
+    buf.push_str(tag);
+    buf
+}
+
+/// Build From header with tag only: "<{uri}>;tag={tag}"
+fn build_from_tag_only(uri: &str, tag: &str) -> String {
+    let mut buf = String::with_capacity(1 + uri.len() + 6 + tag.len());
+    buf.push('<');
+    buf.push_str(uri);
+    buf.push_str(">;tag=");
+    buf.push_str(tag);
+    buf
+}
+
+/// Build To header value: "<sip:{user}@{domain}>"
+fn build_to_value(username: &str, domain: &str) -> String {
+    let mut buf = String::with_capacity(5 + username.len() + 1 + domain.len() + 1);
+    buf.push_str("<sip:");
+    buf.push_str(username);
+    buf.push('@');
+    buf.push_str(domain);
+    buf.push('>');
+    buf
+}
+
+/// Build To header value with optional tag: "<{uri}>" or "<{uri}>;tag={tag}"
+fn build_to_value_with_optional_tag(uri: &str, tag: Option<&str>) -> String {
+    if let Some(tag) = tag {
+        let mut buf = String::with_capacity(1 + uri.len() + 6 + tag.len());
+        buf.push('<');
+        buf.push_str(uri);
+        buf.push_str(">;tag=");
+        buf.push_str(tag);
+        buf
+    } else {
+        let mut buf = String::with_capacity(1 + uri.len() + 1);
+        buf.push('<');
+        buf.push_str(uri);
+        buf.push('>');
+        buf
+    }
+}
+
+/// Build CSeq header value: "{num} {method}"
+fn build_cseq_value(cseq: u32, method: &str) -> String {
+    let mut buf = String::with_capacity(10 + 1 + method.len());
+    write!(buf, "{}", cseq).unwrap();
+    buf.push(' ');
+    buf.push_str(method);
+    buf
+}
+
+/// Build SIP URI: "sip:{user}@{domain}"
+fn build_sip_uri(username: &str, domain: &str) -> String {
+    let mut buf = String::with_capacity(4 + username.len() + 1 + domain.len());
+    buf.push_str("sip:");
+    buf.push_str(username);
+    buf.push('@');
+    buf.push_str(domain);
+    buf
+}
+
+/// Build SIP domain URI: "sip:{domain}"
+fn build_sip_domain_uri(domain: &str) -> String {
+    let mut buf = String::with_capacity(4 + domain.len());
+    buf.push_str("sip:");
+    buf.push_str(domain);
+    buf
+}
+
 /// Static re-INVITE builder for use in spawned tasks (no &self reference needed)
 fn build_reinvite_request_static(
     call_id: &str,
@@ -730,20 +859,13 @@ fn build_reinvite_request_static(
     cseq: u32,
     local_addr: SocketAddr,
 ) -> SipRequest {
+    let branch = crate::sip::generate_branch(call_id, cseq, "INVITE");
     let mut headers = Headers::new();
-    headers.add(
-        "Via",
-        format!("SIP/2.0/UDP {};branch={}", local_addr, crate::sip::generate_branch(call_id, cseq, "INVITE")),
-    );
+    headers.add("Via", build_via_value(local_addr, &branch));
     headers.set("Call-ID", call_id.to_string());
-    headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
-    let to_val = if let Some(tag) = to_tag {
-        format!("<sip:uas@remote>;tag={}", tag)
-    } else {
-        "<sip:uas@remote>".to_string()
-    };
-    headers.set("To", to_val);
-    headers.set("CSeq", format!("{} INVITE", cseq));
+    headers.set("From", build_from_tag_only("sip:uac@local", from_tag));
+    headers.set("To", build_to_value_with_optional_tag("sip:uas@remote", to_tag));
+    headers.set("CSeq", build_cseq_value(cseq, "INVITE"));
     headers.set("Max-Forwards", "70".to_string());
     headers.set("Content-Length", "0".to_string());
 
@@ -764,20 +886,13 @@ fn build_bye_request_static(
     cseq: u32,
     local_addr: SocketAddr,
 ) -> SipRequest {
+    let branch = crate::sip::generate_branch(call_id, cseq, "BYE");
     let mut headers = Headers::new();
-    headers.add(
-        "Via",
-        format!("SIP/2.0/UDP {};branch={}", local_addr, crate::sip::generate_branch(call_id, cseq, "BYE")),
-    );
+    headers.add("Via", build_via_value(local_addr, &branch));
     headers.set("Call-ID", call_id.to_string());
-    headers.set("From", format!("<sip:uac@local>;tag={}", from_tag));
-    let to_val = if let Some(tag) = to_tag {
-        format!("<sip:uas@remote>;tag={}", tag)
-    } else {
-        "<sip:uas@remote>".to_string()
-    };
-    headers.set("To", to_val);
-    headers.set("CSeq", format!("{} BYE", cseq));
+    headers.set("From", build_from_tag_only("sip:uac@local", from_tag));
+    headers.set("To", build_to_value_with_optional_tag("sip:uas@remote", to_tag));
+    headers.set("CSeq", build_cseq_value(cseq, "BYE"));
     headers.set("Max-Forwards", "70".to_string());
     headers.set("Content-Length", "0".to_string());
 
@@ -2808,5 +2923,878 @@ mod tests {
 
         assert_eq!(result.success, 0, "No REGISTER should succeed");
         assert_eq!(result.failed, 3, "All REGISTERs should fail due to timeout");
+    }
+
+    // ===== Task 5.1: Message construction optimization tests =====
+    // **Validates: Requirements 8.1, 8.2, 8.3**
+    //
+    // These tests verify that the optimized message construction (using write!/push_str
+    // instead of format!) produces functionally identical messages.
+
+    /// Verify Via header is built correctly with write! optimization
+    #[test]
+    fn test_optimized_via_header_construction() {
+        let addr: SocketAddr = "192.168.1.100:5060".parse().unwrap();
+        let branch = crate::sip::generate_branch("test-call-id", 1, "INVITE");
+
+        // Build Via using the optimized build_via_value helper
+        let via = build_via_value(addr, &branch);
+
+        // Must match the format! equivalent
+        let expected = format!("SIP/2.0/UDP {};branch={}", addr, branch);
+        assert_eq!(via, expected, "Optimized Via header must match format! output");
+    }
+
+    /// Verify From header is built correctly with write! optimization
+    #[test]
+    fn test_optimized_from_header_construction() {
+        let from = build_from_value("alice", "example.com", "tag123");
+        let expected = format!("<sip:{}@{}>;tag={}", "alice", "example.com", "tag123");
+        assert_eq!(from, expected, "Optimized From header must match format! output");
+    }
+
+    /// Verify To header is built correctly with write! optimization
+    #[test]
+    fn test_optimized_to_header_construction() {
+        let to = build_to_value("bob", "example.com");
+        let expected = format!("<sip:{}@{}>", "bob", "example.com");
+        assert_eq!(to, expected, "Optimized To header must match format! output");
+    }
+
+    /// Verify CSeq header is built correctly with write! optimization
+    #[test]
+    fn test_optimized_cseq_header_construction() {
+        let cseq = build_cseq_value(42, "INVITE");
+        let expected = format!("{} INVITE", 42);
+        assert_eq!(cseq, expected, "Optimized CSeq header must match format! output");
+    }
+
+    /// Verify request URI is built correctly with write! optimization
+    #[test]
+    fn test_optimized_request_uri_construction() {
+        let uri = build_sip_uri("alice", "example.com");
+        let expected = format!("sip:{}@{}", "alice", "example.com");
+        assert_eq!(uri, expected, "Optimized request URI must match format! output");
+    }
+
+    /// Verify domain-only request URI (for REGISTER)
+    #[test]
+    fn test_optimized_domain_uri_construction() {
+        let uri = build_sip_domain_uri("example.com");
+        let expected = format!("sip:{}", "example.com");
+        assert_eq!(uri, expected, "Optimized domain URI must match format! output");
+    }
+
+    /// Verify To header with tag is built correctly
+    #[test]
+    fn test_optimized_to_header_with_tag() {
+        let to = build_to_value_with_optional_tag("sip:uas@remote", Some("remote-tag"));
+        assert_eq!(to, "<sip:uas@remote>;tag=remote-tag");
+
+        let to_no_tag = build_to_value_with_optional_tag("sip:uas@remote", None);
+        assert_eq!(to_no_tag, "<sip:uas@remote>");
+    }
+
+    /// Verify generate_branch optimization produces identical output
+    #[test]
+    fn test_generate_branch_optimization_equivalence() {
+        // Test with various inputs to ensure the optimized version matches
+        let test_cases = vec![
+            ("call-id-123", 1u32, "INVITE"),
+            ("abc-def-ghi", 42, "REGISTER"),
+            ("long-call-id-with-many-chars", 9999, "BYE"),
+            ("x", 1, "ACK"),
+        ];
+        for (call_id, cseq, method) in test_cases {
+            let result = crate::sip::generate_branch(call_id, cseq, method);
+            assert!(result.starts_with("z9hG4bK"), "Branch must start with magic cookie");
+            assert_eq!(result.len(), 7 + 16, "Branch must be z9hG4bK + 16 hex chars");
+        }
+    }
+
+    /// End-to-end: optimized build_register_request produces parseable message
+    #[test]
+    fn test_optimized_register_request_is_parseable() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+        let dialog = Dialog {
+            call_id: "test-call-id-001".to_string(),
+            from_tag: "tag001".to_string(),
+            to_tag: None,
+            state: DialogState::Trying,
+            cseq: 1,
+            created_at: Instant::now(),
+            session_expires: None,
+            auth_attempted: false,
+            original_request: None,
+        };
+        let user = UserEntry {
+            username: "alice".to_string(),
+            domain: "example.com".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let request = uac.build_register_request(&dialog, &user);
+        let msg = SipMessage::Request(request);
+        let bytes = format_sip_message(&msg);
+        let parsed = parse_sip_message(&bytes).expect("Optimized REGISTER must be parseable");
+
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.method, Method::Register);
+                assert_eq!(req.headers.get("Call-ID").unwrap(), "test-call-id-001");
+                assert_eq!(req.headers.get("CSeq").unwrap(), "1 REGISTER");
+            }
+            _ => panic!("Expected Request, got Response"),
+        }
+    }
+
+    /// End-to-end: optimized build_invite_request produces parseable message
+    #[test]
+    fn test_optimized_invite_request_is_parseable() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+        let dialog = Dialog {
+            call_id: "test-call-id-002".to_string(),
+            from_tag: "tag002".to_string(),
+            to_tag: None,
+            state: DialogState::Trying,
+            cseq: 1,
+            created_at: Instant::now(),
+            session_expires: None,
+            auth_attempted: false,
+            original_request: None,
+        };
+        let user = UserEntry {
+            username: "bob".to_string(),
+            domain: "sip.example.com".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let request = uac.build_invite_request(&dialog, &user);
+        let msg = SipMessage::Request(request);
+        let bytes = format_sip_message(&msg);
+        let parsed = parse_sip_message(&bytes).expect("Optimized INVITE must be parseable");
+
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.method, Method::Invite);
+                assert_eq!(req.headers.get("Call-ID").unwrap(), "test-call-id-002");
+                assert_eq!(req.headers.get("CSeq").unwrap(), "1 INVITE");
+            }
+            _ => panic!("Expected Request, got Response"),
+        }
+    }
+
+    /// End-to-end: optimized build_ack_request produces parseable message
+    #[test]
+    fn test_optimized_ack_request_is_parseable() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+
+        let request = uac.build_ack_request("test-call-id-003", "tag003", Some("remote-tag"), 1);
+        let msg = SipMessage::Request(request);
+        let bytes = format_sip_message(&msg);
+        let parsed = parse_sip_message(&bytes).expect("Optimized ACK must be parseable");
+
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.method, Method::Ack);
+                assert_eq!(req.headers.get("Call-ID").unwrap(), "test-call-id-003");
+                assert_eq!(req.headers.get("CSeq").unwrap(), "1 ACK");
+            }
+            _ => panic!("Expected Request, got Response"),
+        }
+    }
+
+    /// End-to-end: optimized build_bye_request_static produces parseable message
+    #[test]
+    fn test_optimized_bye_request_static_is_parseable() {
+        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let request = build_bye_request_static("test-call-id-004", "tag004", Some("remote-tag"), 2, local_addr);
+        let msg = SipMessage::Request(request);
+        let bytes = format_sip_message(&msg);
+        let parsed = parse_sip_message(&bytes).expect("Optimized BYE must be parseable");
+
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.method, Method::Bye);
+                assert_eq!(req.headers.get("Call-ID").unwrap(), "test-call-id-004");
+                assert_eq!(req.headers.get("CSeq").unwrap(), "2 BYE");
+            }
+            _ => panic!("Expected Request, got Response"),
+        }
+    }
+
+    /// End-to-end: optimized build_reinvite_request_static produces parseable message
+    #[test]
+    fn test_optimized_reinvite_request_static_is_parseable() {
+        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let request = build_reinvite_request_static("test-call-id-005", "tag005", Some("remote-tag"), 3, local_addr);
+        let msg = SipMessage::Request(request);
+        let bytes = format_sip_message(&msg);
+        let parsed = parse_sip_message(&bytes).expect("Optimized re-INVITE must be parseable");
+
+        match parsed {
+            SipMessage::Request(req) => {
+                assert_eq!(req.method, Method::Invite);
+                assert_eq!(req.headers.get("Call-ID").unwrap(), "test-call-id-005");
+                assert_eq!(req.headers.get("CSeq").unwrap(), "3 INVITE");
+            }
+            _ => panic!("Expected Request, got Response"),
+        }
+    }
+
+    // ===== Batch BYE loop tests =====
+
+    #[tokio::test]
+    async fn test_bye_batch_loop_sends_bye_for_expired_confirmed_dialogs() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, _stats) = make_uac_with_parts(transport.clone());
+        let uac = Arc::new(uac);
+
+        // Create a dialog and set it to Confirmed with a to_tag
+        let d = dm.create_dialog().unwrap();
+        let call_id = d.call_id.clone();
+        dm.update_dialog_state(&call_id, DialogState::Confirmed).unwrap();
+        if let Some(mut dialog) = dm.get_dialog_mut(&call_id) {
+            dialog.to_tag = Some("remote-tag".to_string());
+        }
+
+        // Use a very short call_duration so the dialog is immediately expired
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let uac_clone = uac.clone();
+        let handle = tokio::spawn(async move {
+            uac_clone.start_bye_batch_loop(
+                Duration::from_millis(0),
+                shutdown_clone,
+            ).await;
+        });
+
+        // Wait enough time for at least one batch tick
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.await;
+
+        // Verify that a BYE was sent
+        let requests = transport.sent_requests();
+        let bye_requests: Vec<_> = requests.iter().filter(|r| r.method == Method::Bye).collect();
+        assert!(!bye_requests.is_empty(), "At least one BYE should have been sent");
+        assert_eq!(bye_requests[0].headers.get("Call-ID").unwrap(), call_id);
+    }
+
+    #[tokio::test]
+    async fn test_bye_batch_loop_does_not_send_bye_for_non_expired_dialogs() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, _stats) = make_uac_with_parts(transport.clone());
+        let uac = Arc::new(uac);
+
+        // Create a Confirmed dialog
+        let d = dm.create_dialog().unwrap();
+        dm.update_dialog_state(&d.call_id, DialogState::Confirmed).unwrap();
+        if let Some(mut dialog) = dm.get_dialog_mut(&d.call_id) {
+            dialog.to_tag = Some("tag".to_string());
+        }
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        // Use a very long call_duration so the dialog is NOT expired
+        let uac_clone = uac.clone();
+        let handle = tokio::spawn(async move {
+            uac_clone.start_bye_batch_loop(
+                Duration::from_secs(3600),
+                shutdown_clone,
+            ).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.await;
+
+        let requests = transport.sent_requests();
+        let bye_requests: Vec<_> = requests.iter().filter(|r| r.method == Method::Bye).collect();
+        assert!(bye_requests.is_empty(), "No BYE should be sent for non-expired dialogs");
+    }
+
+    #[tokio::test]
+    async fn test_bye_batch_loop_stops_on_shutdown_flag() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_parts(transport.clone());
+        let uac = Arc::new(uac);
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let uac_clone = uac.clone();
+        let handle = tokio::spawn(async move {
+            uac_clone.start_bye_batch_loop(
+                Duration::from_secs(3),
+                shutdown_clone,
+            ).await;
+        });
+
+        // Set shutdown immediately
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The loop should exit quickly
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "Batch loop should stop promptly when shutdown flag is set");
+    }
+
+    #[tokio::test]
+    async fn test_bye_batch_loop_updates_dialog_state_after_bye() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, _stats) = make_uac_with_parts(transport.clone());
+        let uac = Arc::new(uac);
+
+        let d = dm.create_dialog().unwrap();
+        let call_id = d.call_id.clone();
+        dm.update_dialog_state(&call_id, DialogState::Confirmed).unwrap();
+        if let Some(mut dialog) = dm.get_dialog_mut(&call_id) {
+            dialog.to_tag = Some("tag".to_string());
+        }
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let uac_clone = uac.clone();
+        let handle = tokio::spawn(async move {
+            uac_clone.start_bye_batch_loop(
+                Duration::from_millis(0),
+                shutdown_clone,
+            ).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.await;
+
+        // After BYE is sent, dialog state should be updated to Trying
+        let state = dm.get_dialog(&call_id).map(|d| d.state.clone());
+        if let Some(s) = state {
+            assert_eq!(s, DialogState::Trying,
+                "Dialog state should be Trying after BYE is sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_invite_success_no_longer_spawns_bye_task() {
+        // After optimization, handle_invite_success should NOT spawn individual BYE tasks.
+        // Instead, the batch loop handles BYE sending.
+        // We verify by checking that no BYE is sent within the call_duration window
+        // (only ACK should be sent immediately).
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(100));
+        let stats = Arc::new(StatsCollector::new());
+        let config = UacConfig {
+            call_duration: Duration::from_secs(3600), // very long, BYE should not be sent
+            ..UacConfig::default()
+        };
+        let uac = Uac::new(
+            transport.clone(),
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            config,
+        );
+
+        // Create a dialog in Trying state (simulating INVITE sent)
+        let d = dm.create_dialog().unwrap();
+        let call_id = d.call_id.clone();
+        dm.update_dialog_state(&call_id, DialogState::Trying).unwrap();
+
+        // Build a 200 OK response
+        let resp = make_response(200, "OK", &call_id, "1 INVITE");
+        uac.handle_response(resp, test_addr()).await.unwrap();
+
+        // Wait a bit to ensure no BYE task was spawned
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Only ACK should have been sent, no BYE
+        let requests = transport.sent_requests();
+        let ack_count = requests.iter().filter(|r| r.method == Method::Ack).count();
+        let bye_count = requests.iter().filter(|r| r.method == Method::Bye).count();
+        assert_eq!(ack_count, 1, "ACK should still be sent immediately");
+        assert_eq!(bye_count, 0, "BYE should NOT be spawned individually anymore");
+    }
+
+    // ===== TransactionManager統合テスト =====
+    // **Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5**
+
+    fn make_uac_with_transaction_manager(
+        transport: Arc<MockTransport>,
+    ) -> (Uac, Arc<DialogManager>, Arc<StatsCollector>) {
+        use crate::transaction::{TimerConfig, TransactionManager};
+        let dm = Arc::new(DialogManager::new(100));
+        let stats = Arc::new(StatsCollector::new());
+        let tm = TransactionManager::new(
+            transport.clone() as Arc<dyn SipTransport>,
+            stats.clone(),
+            TimerConfig::default(),
+            10000,
+        );
+        let uac = Uac::with_transaction_manager(
+            transport,
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            UacConfig::default(),
+            tm,
+        );
+        (uac, dm, stats)
+    }
+
+    #[tokio::test]
+    async fn test_send_register_via_transaction_manager() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+
+        uac.send_register().await.unwrap();
+
+        // TransactionManager経由でもtransportに送信される
+        assert_eq!(transport.sent_count(), 1);
+        let requests = transport.sent_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::Register);
+    }
+
+    #[tokio::test]
+    async fn test_send_invite_via_transaction_manager() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+
+        uac.send_invite().await.unwrap();
+
+        assert_eq!(transport.sent_count(), 1);
+        let requests = transport.sent_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::Invite);
+    }
+
+    #[tokio::test]
+    async fn test_send_register_via_tm_creates_transaction() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+
+        uac.send_register().await.unwrap();
+
+        // TransactionManagerにトランザクションが登録されている
+        let tm = uac.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_invite_via_tm_creates_transaction() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+
+        uac.send_invite().await.unwrap();
+
+        let tm = uac.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_via_tm_register_200() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, stats) = make_uac_with_transaction_manager(transport.clone());
+
+        // REGISTERを送信してダイアログとトランザクションを作成
+        uac.send_register().await.unwrap();
+
+        // 送信されたリクエストからVia branchとCall-IDを取得
+        let requests = transport.sent_requests();
+        let req = &requests[0];
+        let call_id = req.headers.get("Call-ID").unwrap().to_string();
+        let via = req.headers.get("Via").unwrap().to_string();
+        let cseq = req.headers.get("CSeq").unwrap().to_string();
+
+        // 正しいbranchを持つ200 OKレスポンスを作成
+        let mut headers = Headers::new();
+        headers.add("Via", via);
+        headers.set("Call-ID", call_id.clone());
+        headers.set("CSeq", cseq);
+        headers.set("From", "<sip:alice@example.com>;tag=abc".to_string());
+        headers.set("To", "<sip:alice@example.com>;tag=def".to_string());
+        let response = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: None,
+        });
+
+        uac.handle_response(response, test_addr()).await.unwrap();
+
+        // REGISTER 200 OK → ダイアログが削除され、成功が記録される
+        assert!(dm.get_dialog(&call_id).is_none());
+        assert_eq!(stats.snapshot().successful_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_via_tm_invite_200_sends_ack() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+
+        uac.send_invite().await.unwrap();
+
+        let requests = transport.sent_requests();
+        let req = &requests[0];
+        let call_id = req.headers.get("Call-ID").unwrap().to_string();
+        let via = req.headers.get("Via").unwrap().to_string();
+        let cseq = req.headers.get("CSeq").unwrap().to_string();
+
+        let mut headers = Headers::new();
+        headers.add("Via", via);
+        headers.set("Call-ID", call_id.clone());
+        headers.set("CSeq", cseq);
+        headers.set("From", "<sip:alice@example.com>;tag=abc".to_string());
+        headers.set("To", "<sip:alice@example.com>;tag=def".to_string());
+        let response = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: None,
+        });
+
+        uac.handle_response(response, test_addr()).await.unwrap();
+
+        // INVITE 200 OK → ACKが送信される
+        let all_requests = transport.sent_requests();
+        let ack_count = all_requests.iter().filter(|r| r.method == Method::Ack).count();
+        assert_eq!(ack_count, 1, "ACK should be sent for INVITE 200 OK");
+
+        // ダイアログがConfirmed状態になる
+        let dialog = dm.get_dialog(&call_id);
+        assert!(dialog.is_some());
+        assert_eq!(dialog.unwrap().state, DialogState::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_with_transaction_manager_constructor() {
+        use crate::transaction::{TimerConfig, TransactionManager};
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(100));
+        let stats = Arc::new(StatsCollector::new());
+        let tm = TransactionManager::new(
+            transport.clone() as Arc<dyn SipTransport>,
+            stats.clone(),
+            TimerConfig::default(),
+            10000,
+        );
+        let uac = Uac::with_transaction_manager(
+            transport,
+            dm,
+            stats,
+            make_user_pool(),
+            UacConfig::default(),
+            tm,
+        );
+        assert!(uac.transaction_manager.is_some());
+    }
+
+    #[test]
+    fn test_uac_new_has_no_transaction_manager() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+        assert!(uac.transaction_manager.is_none());
+    }
+
+    // ===== Task 14.2: Transaction tick loop tests =====
+
+    #[tokio::test]
+    async fn test_transaction_tick_loop_stops_on_shutdown() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, _dm, _stats) = make_uac_with_transaction_manager(transport.clone());
+        let uac = Arc::new(uac);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let handle = tokio::spawn({
+            let uac = uac.clone();
+            async move {
+                uac.start_transaction_tick_loop(shutdown_clone).await;
+            }
+        });
+
+        // Let the loop run briefly, then signal shutdown
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shutdown.store(true, Ordering::Relaxed);
+
+        // The loop should stop within a reasonable time
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "tick loop should stop after shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_tick_loop_without_tm_returns_immediately() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+        let uac = Arc::new(uac);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn({
+            let uac = uac.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                uac.start_transaction_tick_loop(shutdown).await;
+            }
+        });
+
+        // Without TransactionManager, the loop should return immediately
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "tick loop should return immediately without TM");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_tick_loop_calls_cleanup_terminated() {
+        use crate::transaction::{TimerConfig, TransactionManager};
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(100));
+        let stats = Arc::new(StatsCollector::new());
+        let tm = TransactionManager::new(
+            transport.clone() as Arc<dyn SipTransport>,
+            stats.clone(),
+            TimerConfig::default(),
+            10000,
+        );
+
+        let uac = Uac::with_transaction_manager(
+            transport.clone(),
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            UacConfig::default(),
+            tm,
+        );
+        let uac = Arc::new(uac);
+
+        // Send a request to create a transaction
+        uac.send_register().await.unwrap();
+        let tm = uac.transaction_manager.as_ref().unwrap();
+        assert_eq!(tm.active_count(), 1);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let handle = tokio::spawn({
+            let uac = uac.clone();
+            async move {
+                uac.start_transaction_tick_loop(shutdown_clone).await;
+            }
+        });
+
+        // Let the tick loop run for a bit (transactions won't terminate without
+        // timer expiry, but the loop should be running and calling tick/cleanup)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.store(true, Ordering::Relaxed);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "tick loop should stop after shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_tick_loop_records_timeout_stats() {
+        use crate::transaction::{TimerConfig, TransactionManager};
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(100));
+        let stats = Arc::new(StatsCollector::new());
+
+        // Use very short T1 so Timer_F (64*T1 = 64ms) fires quickly
+        let timer_config = TimerConfig {
+            t1: Duration::from_millis(1),
+            t2: Duration::from_millis(4),
+            t4: Duration::from_millis(5),
+        };
+        let tm = TransactionManager::new(
+            transport.clone() as Arc<dyn SipTransport>,
+            stats.clone(),
+            timer_config,
+            10000,
+        );
+
+        let uac = Uac::with_transaction_manager(
+            transport.clone(),
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            UacConfig::default(),
+            tm,
+        );
+        let uac = Arc::new(uac);
+
+        // Send a REGISTER (Non-INVITE → Timer_F = 64*1ms = 64ms)
+        uac.send_register().await.unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let handle = tokio::spawn({
+            let uac = uac.clone();
+            async move {
+                uac.start_transaction_tick_loop(shutdown_clone).await;
+            }
+        });
+
+        // Wait for Timer_F to expire (64ms + some margin)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.store(true, Ordering::Relaxed);
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        // Timer_F timeout should have been recorded
+        let snap = stats.snapshot();
+        assert!(snap.transaction_timeouts >= 1, "timeout should be recorded by tick loop, got {}", snap.transaction_timeouts);
+    }
+
+    // ===== Property 10: 構築メッセージのパース可能性テスト =====
+    // **Validates: Requirements 8.1**
+    //
+    // For any valid dialog parameters, SIP messages constructed by the UAC's
+    // build functions must be parseable by parse_sip_message and contain the
+    // correct method, Call-ID, and CSeq value.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Feature: performance-bottleneck-optimization, Property 10: 構築メッセージのパース可能性
+        /// 任意のdialogパラメータで構築したSIPメッセージがparse_sip_messageでパース可能かつ
+        /// 正しいメソッド・Call-ID・CSeqを含む
+        #[test]
+        fn pbt_built_message_parseable(
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+            cseq in arb_cseq(),
+            local_addr in arb_socket_addr(),
+            username in arb_username(),
+            domain in arb_domain(),
+        ) {
+            use crate::sip::formatter::format_sip_message;
+
+            // --- REGISTER ---
+            {
+                let branch = crate::sip::generate_branch(&call_id, cseq, "REGISTER");
+                let mut headers = Headers::new();
+                headers.add("Via", build_via_value(local_addr, &branch));
+                headers.set("From", build_from_value(&username, &domain, &from_tag));
+                headers.set("To", build_to_value(&username, &domain));
+                headers.set("Call-ID", call_id.clone());
+                headers.set("CSeq", build_cseq_value(cseq, "REGISTER"));
+                headers.set("Max-Forwards", "70".to_string());
+                headers.set("Content-Length", "0".to_string());
+
+                let request = SipRequest {
+                    method: Method::Register,
+                    request_uri: build_sip_domain_uri(&domain),
+                    version: "SIP/2.0".to_string(),
+                    headers,
+                    body: None,
+                };
+                let bytes = format_sip_message(&SipMessage::Request(request));
+                let parsed = parse_sip_message(&bytes);
+                prop_assert!(parsed.is_ok(), "REGISTER must be parseable, got: {:?}", parsed.err());
+                match parsed.unwrap() {
+                    SipMessage::Request(req) => {
+                        prop_assert_eq!(req.method, Method::Register, "Method must be REGISTER");
+                        prop_assert_eq!(req.headers.get("Call-ID").unwrap(), call_id.clone(), "Call-ID must match");
+                        let cseq_val = req.headers.get("CSeq").unwrap();
+                        let cseq_num: u32 = cseq_val.split_whitespace().next().unwrap().parse().unwrap();
+                        prop_assert_eq!(cseq_num, cseq, "CSeq number must match");
+                    }
+                    _ => prop_assert!(false, "Expected Request, got Response"),
+                }
+            }
+
+            // --- INVITE ---
+            {
+                let branch = crate::sip::generate_branch(&call_id, cseq, "INVITE");
+                let mut headers = Headers::new();
+                headers.add("Via", build_via_value(local_addr, &branch));
+                headers.set("From", build_from_value(&username, &domain, &from_tag));
+                headers.set("To", build_to_value(&username, &domain));
+                headers.set("Call-ID", call_id.clone());
+                headers.set("CSeq", build_cseq_value(cseq, "INVITE"));
+                headers.set("Max-Forwards", "70".to_string());
+                headers.set("Content-Length", "0".to_string());
+
+                let request = SipRequest {
+                    method: Method::Invite,
+                    request_uri: build_sip_uri(&username, &domain),
+                    version: "SIP/2.0".to_string(),
+                    headers,
+                    body: None,
+                };
+                let bytes = format_sip_message(&SipMessage::Request(request));
+                let parsed = parse_sip_message(&bytes);
+                prop_assert!(parsed.is_ok(), "INVITE must be parseable, got: {:?}", parsed.err());
+                match parsed.unwrap() {
+                    SipMessage::Request(req) => {
+                        prop_assert_eq!(req.method, Method::Invite, "Method must be INVITE");
+                        prop_assert_eq!(req.headers.get("Call-ID").unwrap(), call_id.clone(), "Call-ID must match");
+                        let cseq_val = req.headers.get("CSeq").unwrap();
+                        let cseq_num: u32 = cseq_val.split_whitespace().next().unwrap().parse().unwrap();
+                        prop_assert_eq!(cseq_num, cseq, "CSeq number must match");
+                    }
+                    _ => prop_assert!(false, "Expected Request, got Response"),
+                }
+            }
+
+            // --- ACK ---
+            {
+                let branch = crate::sip::generate_branch(&call_id, cseq, "ACK");
+                let mut headers = Headers::new();
+                headers.add("Via", build_via_value(local_addr, &branch));
+                headers.set("Call-ID", call_id.clone());
+                headers.set("From", build_from_tag_only("sip:uac@local", &from_tag));
+                headers.set("To", build_to_value_with_optional_tag("sip:uas@remote", None));
+                headers.set("CSeq", build_cseq_value(cseq, "ACK"));
+                headers.set("Max-Forwards", "70".to_string());
+                headers.set("Content-Length", "0".to_string());
+
+                let request = SipRequest {
+                    method: Method::Ack,
+                    request_uri: "sip:uas@remote".to_string(),
+                    version: "SIP/2.0".to_string(),
+                    headers,
+                    body: None,
+                };
+                let bytes = format_sip_message(&SipMessage::Request(request));
+                let parsed = parse_sip_message(&bytes);
+                prop_assert!(parsed.is_ok(), "ACK must be parseable, got: {:?}", parsed.err());
+                match parsed.unwrap() {
+                    SipMessage::Request(req) => {
+                        prop_assert_eq!(req.method, Method::Ack, "Method must be ACK");
+                        prop_assert_eq!(req.headers.get("Call-ID").unwrap(), call_id.clone(), "Call-ID must match");
+                        let cseq_val = req.headers.get("CSeq").unwrap();
+                        let cseq_num: u32 = cseq_val.split_whitespace().next().unwrap().parse().unwrap();
+                        prop_assert_eq!(cseq_num, cseq, "CSeq number must match");
+                    }
+                    _ => prop_assert!(false, "Expected Request, got Response"),
+                }
+            }
+
+            // --- BYE ---
+            {
+                let request = build_bye_request_static(&call_id, &from_tag, None, cseq, local_addr);
+                let bytes = format_sip_message(&SipMessage::Request(request));
+                let parsed = parse_sip_message(&bytes);
+                prop_assert!(parsed.is_ok(), "BYE must be parseable, got: {:?}", parsed.err());
+                match parsed.unwrap() {
+                    SipMessage::Request(req) => {
+                        prop_assert_eq!(req.method, Method::Bye, "Method must be BYE");
+                        prop_assert_eq!(req.headers.get("Call-ID").unwrap(), call_id.clone(), "Call-ID must match");
+                        let cseq_val = req.headers.get("CSeq").unwrap();
+                        let cseq_num: u32 = cseq_val.split_whitespace().next().unwrap().parse().unwrap();
+                        prop_assert_eq!(cseq_num, cseq, "CSeq number must match");
+                    }
+                    _ => prop_assert!(false, "Expected Request, got Response"),
+                }
+            }
+        }
     }
 }

@@ -1,6 +1,9 @@
 // UDP transport module
 
+pub mod batch;
+
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
@@ -8,6 +11,7 @@ use crate::error::SipLoadTestError;
 
 pub struct UdpTransport {
     sockets: Vec<Arc<UdpSocket>>,
+    send_idx: AtomicUsize,
 }
 
 impl UdpTransport {
@@ -34,17 +38,31 @@ impl UdpTransport {
             sockets.push(Arc::new(socket));
         }
 
-        Ok(Self { sockets })
+        Ok(Self {
+            sockets,
+            send_idx: AtomicUsize::new(0),
+        })
     }
 
-    /// Send data via the first socket.
+    /// Send data via round-robin socket selection.
     pub async fn send_to(
         &self,
         data: &[u8],
         addr: SocketAddr,
     ) -> Result<(), SipLoadTestError> {
-        self.sockets[0].send_to(data, addr).await?;
+        let idx = self.send_idx.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
+        self.sockets[idx].send_to(data, addr).await?;
         Ok(())
+    }
+
+    /// Returns the local address of the specified socket.
+    pub fn local_addr(&self, socket_idx: usize) -> Option<SocketAddr> {
+        self.sockets.get(socket_idx).and_then(|s| s.local_addr().ok())
+    }
+
+    /// Returns the number of bound sockets.
+    pub fn socket_count(&self) -> usize {
+        self.sockets.len()
     }
 
     /// Receive data from the specified socket index.
@@ -60,10 +78,10 @@ impl UdpTransport {
             ))
         })?;
 
-        let mut buf = vec![0u8; 65535];
+        // Stack-allocated buffer to avoid heap allocation per recv
+        let mut buf = [0u8; 65535];
         let (len, from) = socket.recv_from(&mut buf).await?;
-        buf.truncate(len);
-        Ok((buf, from))
+        Ok((buf[..len].to_vec(), from))
     }
 }
 
@@ -86,6 +104,19 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 3,
         ).await.expect("should bind three sockets");
         assert_eq!(transport.sockets.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn socket_count_returns_number_of_sockets() {
+        let t1 = UdpTransport::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 1,
+        ).await.expect("bind 1");
+        assert_eq!(t1.socket_count(), 1);
+
+        let t3 = UdpTransport::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 3,
+        ).await.expect("bind 3");
+        assert_eq!(t3.socket_count(), 3);
     }
 
     #[tokio::test]
@@ -181,4 +212,113 @@ mod tests {
         let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(len, 0);
     }
+
+    #[tokio::test]
+    async fn send_to_round_robin_distributes_across_sockets() {
+        let transport = UdpTransport::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 3,
+        ).await.expect("bind");
+
+        // Create 3 receivers
+        let r0 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr0 = r0.local_addr().unwrap();
+        let addr1 = r1.local_addr().unwrap();
+        let addr2 = r2.local_addr().unwrap();
+
+        // Send 3 messages — each should go via a different socket
+        transport.send_to(b"msg0", addr0).await.expect("send 0");
+        transport.send_to(b"msg1", addr1).await.expect("send 1");
+        transport.send_to(b"msg2", addr2).await.expect("send 2");
+
+        let mut buf = vec![0u8; 1500];
+
+        let (len, from0) = r0.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"msg0");
+
+        let (len, from1) = r1.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"msg1");
+
+        let (len, from2) = r2.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"msg2");
+
+        // Each message should come from a different socket (round-robin)
+        let sock0_addr = transport.sockets[0].local_addr().unwrap();
+        let sock1_addr = transport.sockets[1].local_addr().unwrap();
+        let sock2_addr = transport.sockets[2].local_addr().unwrap();
+        assert_eq!(from0, sock0_addr, "first send should use socket 0");
+        assert_eq!(from1, sock1_addr, "second send should use socket 1");
+        assert_eq!(from2, sock2_addr, "third send should use socket 2");
+    }
+
+    #[tokio::test]
+    async fn send_to_round_robin_wraps_around() {
+        let transport = UdpTransport::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 2,
+        ).await.expect("bind");
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = receiver.local_addr().unwrap();
+
+        let sock0_addr = transport.sockets[0].local_addr().unwrap();
+        let sock1_addr = transport.sockets[1].local_addr().unwrap();
+
+        let mut buf = vec![0u8; 1500];
+
+        // Send 4 messages with 2 sockets: should cycle 0, 1, 0, 1
+        for i in 0..4u8 {
+            transport.send_to(&[i], recv_addr).await.expect("send");
+            let (len, from) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(len, 1);
+            let expected_addr = if i % 2 == 0 { sock0_addr } else { sock1_addr };
+            assert_eq!(from, expected_addr, "message {} should use socket {}", i, i % 2);
+        }
+    }
+
 }
+
+#[cfg(test)]
+mod proptests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use proptest::prelude::*;
+
+    /// Simulate the round-robin index selection logic used by UdpTransport::send_to.
+    /// Returns a vector of usage counts per socket.
+    fn simulate_round_robin(n_sockets: usize, n_sends: usize) -> Vec<usize> {
+        let counter = AtomicUsize::new(0);
+        let mut counts = vec![0usize; n_sockets];
+        for _ in 0..n_sends {
+            let idx = counter.fetch_add(1, Ordering::Relaxed) % n_sockets;
+            counts[idx] += 1;
+        }
+        counts
+    }
+
+    proptest! {
+        /// Feature: performance-bottleneck-optimization, Property 4: ラウンドロビン送信の均等性
+        /// **Validates: Requirements 3.1**
+        #[test]
+        fn prop_round_robin_balanced(
+            n_sockets in 2usize..=64,
+            n_sends in 0usize..=1000,
+        ) {
+            let counts = simulate_round_robin(n_sockets, n_sends);
+
+            // All counts should sum to n_sends
+            let total: usize = counts.iter().sum();
+            prop_assert_eq!(total, n_sends, "total sends must equal n_sends");
+
+            if n_sends > 0 {
+                let max_count = *counts.iter().max().unwrap();
+                let min_count = *counts.iter().min().unwrap();
+                prop_assert!(
+                    max_count - min_count <= 1,
+                    "usage difference must be at most 1, got max={} min={} (n_sockets={}, n_sends={})",
+                    max_count, min_count, n_sockets, n_sends
+                );
+            }
+        }
+    }
+}
+

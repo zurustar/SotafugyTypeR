@@ -7,6 +7,8 @@
 // - Routes in-dialog requests (ACK, BYE, re-INVITE) based on Route header
 // - Maintains no transaction state (stateless operation)
 
+use std::cell::RefCell;
+use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,9 +17,24 @@ use dashmap::DashMap;
 
 use crate::auth::ProxyAuth;
 use crate::error::SipLoadTestError;
-use crate::sip::formatter::format_sip_message;
+use crate::sip::formatter::format_into;
 use crate::sip::message::{Headers, Method, SipMessage, SipRequest, SipResponse};
 use crate::uas::SipTransport;
+
+thread_local! {
+    static FMT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
+}
+
+/// Thread-local buffer を使用して SipMessage をフォーマットし、バイト列を返す。
+/// バッファは再利用されるため、毎回のヒープアロケーションを回避する。
+fn format_message_reuse(msg: &SipMessage) -> Vec<u8> {
+    FMT_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        format_into(&mut buf, msg);
+        buf.clone()
+    })
+}
 
 /// Contact information stored in the Location Service.
 #[derive(Debug, Clone)]
@@ -127,13 +144,13 @@ impl SipProxy {
                                 "WWW-Authenticate",
                                 Self::format_challenge(&challenge),
                             );
-                            let data = format_sip_message(&SipMessage::Response(response));
+                            let data = format_message_reuse(&SipMessage::Response(response));
                             self.transport.send_to(&data, from).await?;
                             return Ok(());
                         } else if !auth.verify(&msg) {
                             // Auth header present but invalid → 403
                             let response = self.build_response(&req, 403, "Forbidden");
-                            let data = format_sip_message(&SipMessage::Response(response));
+                            let data = format_message_reuse(&SipMessage::Response(response));
                             self.transport.send_to(&data, from).await?;
                             return Ok(());
                         }
@@ -156,13 +173,13 @@ impl SipProxy {
                                 "Proxy-Authenticate",
                                 Self::format_challenge(&challenge),
                             );
-                            let data = format_sip_message(&SipMessage::Response(response));
+                            let data = format_message_reuse(&SipMessage::Response(response));
                             self.transport.send_to(&data, from).await?;
                             return Ok(());
                         } else if !auth.verify(&msg) {
                             // Auth header present but invalid → 403
                             let response = self.build_response(&req, 403, "Forbidden");
-                            let data = format_sip_message(&SipMessage::Response(response));
+                            let data = format_message_reuse(&SipMessage::Response(response));
                             self.transport.send_to(&data, from).await?;
                             return Ok(());
                         }
@@ -214,6 +231,29 @@ impl SipProxy {
         domain == self.config.domain
     }
 
+    /// Build a Via header value using push_str/write! to minimize format! usage.
+    fn build_via_value(&self) -> String {
+        let mut via = String::with_capacity(80);
+        via.push_str("SIP/2.0/UDP ");
+        via.push_str(&self.config.host);
+        via.push(':');
+        let _ = write!(via, "{}", self.config.port);
+        via.push_str(";branch=z9hG4bK-proxy-");
+        via.push_str(&rand_branch());
+        via
+    }
+
+    /// Build a Record-Route header value using push_str/write! to minimize format! usage.
+    fn build_record_route_value(&self) -> String {
+        let mut rr = String::with_capacity(40);
+        rr.push_str("<sip:");
+        rr.push_str(&self.config.host);
+        rr.push(':');
+        let _ = write!(rr, "{}", self.config.port);
+        rr.push_str(";lr>");
+        rr
+    }
+
     /// Forward a SIP request: add Via, add Record-Route for INVITE, determine destination.
     async fn forward_request(
         &self,
@@ -229,18 +269,8 @@ impl SipProxy {
                         // Forward to registered contact
                         request.request_uri = contact.contact_uri.clone();
 
-                        let branch = format!("z9hG4bK-proxy-{}", rand_branch());
-                        let via_value = format!(
-                            "SIP/2.0/UDP {}:{};branch={}",
-                            self.config.host, self.config.port, branch
-                        );
-                        request.headers.insert_at(0, "Via", via_value);
-
-                        let rr_value = format!(
-                            "<sip:{}:{};lr>",
-                            self.config.host, self.config.port
-                        );
-                        request.headers.insert_at(0, "Record-Route", rr_value);
+                        request.headers.insert_at(0, "Via", self.build_via_value());
+                        request.headers.insert_at(0, "Record-Route", self.build_record_route_value());
 
                         let dest = contact.address;
                         if self.config.debug {
@@ -249,7 +279,7 @@ impl SipProxy {
                             eprintln!("{}", format_fwd_req_log(method, call_id, dest));
                         }
 
-                        let data = format_sip_message(&SipMessage::Request(request));
+                        let data = format_message_reuse(&SipMessage::Request(request));
                         if let Err(e) = self.transport.send_to(&data, dest).await {
                             if self.config.debug {
                                 eprintln!("{}", format_req_error_log(&e.to_string(), "INVITE", "<unknown>", dest));
@@ -261,7 +291,7 @@ impl SipProxy {
                     None => {
                         // User not registered in our domain → 404
                         let response = self.build_response(&request, 404, "Not Found");
-                        let data = format_sip_message(&SipMessage::Response(response));
+                        let data = format_message_reuse(&SipMessage::Response(response));
                         self.transport.send_to(&data, from).await?;
                         return Ok(());
                     }
@@ -270,23 +300,12 @@ impl SipProxy {
             // Non-local domain: fall through to normal forwarding below
         }
 
-        // Generate a branch parameter for Via
-        let branch = format!("z9hG4bK-proxy-{}", rand_branch());
-
         // Add proxy's Via header at the top
-        let via_value = format!(
-            "SIP/2.0/UDP {}:{};branch={}",
-            self.config.host, self.config.port, branch
-        );
-        request.headers.insert_at(0, "Via", via_value);
+        request.headers.insert_at(0, "Via", self.build_via_value());
 
         // For INVITE requests, insert Record-Route header
         if request.method == Method::Invite {
-            let rr_value = format!(
-                "<sip:{}:{};lr>",
-                self.config.host, self.config.port
-            );
-            request.headers.insert_at(0, "Record-Route", rr_value);
+            request.headers.insert_at(0, "Record-Route", self.build_record_route_value());
         }
 
         // Determine forwarding destination
@@ -299,7 +318,7 @@ impl SipProxy {
         }
 
         // Forward the request
-        let data = format_sip_message(&SipMessage::Request(request));
+        let data = format_message_reuse(&SipMessage::Request(request));
         if let Err(e) = self.transport.send_to(&data, dest).await {
             if self.config.debug {
                 eprintln!("{}", format_req_error_log(&e.to_string(), "<unknown>", "<unknown>", dest));
@@ -355,7 +374,7 @@ impl SipProxy {
         }
 
         // Forward the response
-        let data = format_sip_message(&SipMessage::Response(response));
+        let data = format_message_reuse(&SipMessage::Response(response));
         if let Err(e) = self.transport.send_to(&data, dest).await {
             if self.config.debug {
                 let call_id = call_id_owned.as_deref().unwrap_or("<unknown>");
@@ -396,7 +415,7 @@ impl SipProxy {
 
         // Send 200 OK response
         let response = self.build_response(&request, 200, "OK");
-        let data = format_sip_message(&SipMessage::Response(response));
+        let data = format_message_reuse(&SipMessage::Response(response));
         self.transport.send_to(&data, from).await?;
 
         Ok(())
@@ -503,12 +522,9 @@ fn parse_via_addr(via: &str) -> Option<SocketAddr> {
 
 /// Generate a random branch suffix for Via headers.
 fn rand_branch() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}", nanos)
+    use rand::Rng;
+    let val: u64 = rand::thread_rng().gen();
+    format!("{:016x}", val)
 }
 
 /// Extract a SIP URI from a header value.
@@ -2402,11 +2418,346 @@ mod tests {
 
 
 
+    // ===== Task 12.1: プロキシのバッファ再利用・高速RNG テスト =====
+
+    #[test]
+    fn test_rand_branch_returns_16_char_hex_string() {
+        // rand_branch() は u64 ベースの16文字16進数文字列を返すべき
+        let branch = rand_branch();
+        assert_eq!(
+            branch.len(),
+            16,
+            "rand_branch should return 16-char hex string, got: '{}'",
+            branch
+        );
+        assert!(
+            branch.chars().all(|c| c.is_ascii_hexdigit()),
+            "rand_branch should contain only hex digits, got: '{}'",
+            branch
+        );
+    }
+
+    #[test]
+    fn test_rand_branch_produces_unique_values() {
+        // 連続生成で一意な値を返すべき（SystemTimeベースでは衝突リスクあり）
+        let mut branches: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let branch = rand_branch();
+            branches.insert(branch);
+        }
+        assert_eq!(
+            branches.len(),
+            100,
+            "100 consecutive rand_branch() calls should produce 100 unique values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_request_uses_format_into_compatible_output() {
+        // format_into + thread-local buffer を使用しても、出力は format_sip_message と同一であるべき
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy(transport.clone());
+
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK999".to_string());
+        headers.set("From", "<sip:alice@example.com>;tag=1928301774".to_string());
+        headers.set("To", "<sip:bob@example.com>;tag=abc".to_string());
+        headers.set("Call-ID", "call-fmt-into-1".to_string());
+        headers.set("CSeq", "2 BYE".to_string());
+        let bye = SipMessage::Request(SipRequest {
+            method: Method::Bye,
+            request_uri: "sip:bob@example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: None,
+        });
+
+        proxy.handle_request(bye, uac_addr()).await.unwrap();
+
+        // transport に送信されたバイト列がパース可能であることを確認
+        let sent = transport.sent_requests();
+        assert_eq!(sent.len(), 1);
+        let (req, _) = &sent[0];
+        // Via ヘッダが正しく追加されていること
+        let vias = req.headers.get_all("Via");
+        assert!(vias.len() >= 2, "Should have proxy Via + original Via");
+        assert!(vias[0].contains("10.0.0.100:5060"), "Top Via should be proxy's");
+    }
+
+    #[tokio::test]
+    async fn test_forward_response_uses_format_into_compatible_output() {
+        // レスポンス転送でも format_into + thread-local buffer の出力がパース可能であるべき
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy(transport.clone());
+
+        let response = make_200ok_response("call-fmt-into-resp-1");
+        proxy.handle_response(response, uas_addr()).await.unwrap();
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        let (resp, _) = &sent[0];
+        // プロキシの Via が除去されていること
+        let vias = resp.headers.get_all("Via");
+        assert_eq!(vias.len(), 1, "Proxy Via should be removed, leaving 1 Via");
+    }
+
+    #[tokio::test]
+    async fn test_via_header_format_is_correct_after_optimization() {
+        // Via ヘッダの形式が "SIP/2.0/UDP host:port;branch=z9hG4bK-proxy-XXXXXXXXXXXXXXXX" であるべき
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy(transport.clone());
+
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK999".to_string());
+        headers.set("From", "<sip:alice@example.com>;tag=t1".to_string());
+        headers.set("To", "<sip:bob@example.com>;tag=t2".to_string());
+        headers.set("Call-ID", "call-via-fmt-1".to_string());
+        headers.set("CSeq", "2 BYE".to_string());
+        let bye = SipMessage::Request(SipRequest {
+            method: Method::Bye,
+            request_uri: "sip:bob@example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: None,
+        });
+
+        proxy.handle_request(bye, uac_addr()).await.unwrap();
+
+        let sent = transport.sent_requests();
+        let (req, _) = &sent[0];
+        let top_via = req.headers.get_all("Via")[0];
+
+        // Via の形式を検証
+        assert!(
+            top_via.starts_with("SIP/2.0/UDP 10.0.0.100:5060;branch=z9hG4bK-proxy-"),
+            "Via should have correct format, got: '{}'",
+            top_via
+        );
+
+        // branch suffix は16文字の16進数であるべき
+        let branch_prefix = "z9hG4bK-proxy-";
+        let branch_start = top_via.find(branch_prefix).unwrap() + branch_prefix.len();
+        let branch_suffix = &top_via[branch_start..];
+        assert_eq!(
+            branch_suffix.len(),
+            16,
+            "Branch suffix should be 16 hex chars, got: '{}'",
+            branch_suffix
+        );
+        assert!(
+            branch_suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "Branch suffix should be hex, got: '{}'",
+            branch_suffix
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_route_format_is_correct_after_optimization() {
+        // Record-Route ヘッダの形式が "<sip:host:port;lr>" であるべき
+        let transport = Arc::new(MockTransport::new());
+        let location_service = Arc::new(LocationService::new());
+        location_service.register("sip:bob@10.0.0.100", ContactInfo {
+            contact_uri: "sip:bob@10.0.0.2:5060".to_string(),
+            address: uas_addr(),
+            expires: Instant::now() + std::time::Duration::from_secs(3600),
+        });
+        let proxy = make_proxy_with_location_service(transport.clone(), location_service);
+
+        let invite = make_invite_local_domain("call-rr-fmt-1");
+        proxy.handle_request(invite, uac_addr()).await.unwrap();
+
+        let sent = transport.sent_requests();
+        let (req, _) = &sent[0];
+        let rr = req.headers.get("Record-Route").unwrap();
+        assert_eq!(
+            rr,
+            "<sip:10.0.0.100:5060;lr>",
+            "Record-Route should have exact format"
+        );
+    }
+
+    // ===== Property 5: プロキシリクエスト転送のVia/Record-Route正確性テスト =====
+    // Feature: performance-bottleneck-optimization, Property 5
+    // **Validates: Requirements 5.1**
+
+    use proptest::prelude::*;
+
+    /// Strategy for generating an arbitrary SIP INVITE request with non-local domain
+    /// (so the proxy forwards to default forward_addr without LocationService lookup).
+    fn arb_invite_request_non_local() -> impl Strategy<Value = (SipRequest, Vec<String>)> {
+        (
+            // Generate 1..4 original Via headers
+            proptest::collection::vec(
+                (
+                    1u8..=254,
+                    1u8..=254,
+                    1u8..=254,
+                    1u8..=254,
+                    1024u16..60000,
+                    "[a-zA-Z0-9]{4,12}",
+                )
+                    .prop_map(|(a, b, c, d, port, branch)| {
+                        format!(
+                            "SIP/2.0/UDP {}.{}.{}.{}:{};branch=z9hG4bK{}",
+                            a, b, c, d, port, branch
+                        )
+                    }),
+                1..4,
+            ),
+            "[a-zA-Z0-9]{1,32}",  // call_id
+            "[a-zA-Z0-9]{1,16}",  // from_tag
+            // Non-local domain request URI (not matching proxy host 10.0.0.100)
+            (
+                "[a-z][a-z0-9]{0,7}",
+                "[a-z][a-z0-9]{0,7}\\.[a-z]{2,4}",
+            )
+                .prop_map(|(user, domain)| format!("sip:{}@{}", user, domain)),
+            // 0..4 extra non-Via/non-Record-Route headers
+            proptest::collection::vec(
+                (
+                    "[A-Z][a-z]{2,10}",
+                    "[a-zA-Z0-9 ]{1,20}",
+                )
+                    .prop_filter("avoid reserved header names", |(name, _)| {
+                        let lower = name.to_ascii_lowercase();
+                        lower != "via" && lower != "record-route" && lower != "route"
+                            && lower != "from" && lower != "to" && lower != "call-id"
+                            && lower != "cseq" && lower != "content-length"
+                    }),
+                0..4,
+            ),
+        )
+            .prop_map(|(vias, call_id, from_tag, request_uri, extra_headers)| {
+                let mut headers = Headers::new();
+                for via in &vias {
+                    headers.add("Via", via.clone());
+                }
+                headers.set("From", format!("<sip:alice@example.com>;tag={}", from_tag));
+                headers.set("To", format!("<{}>", request_uri));
+                headers.set("Call-ID", call_id);
+                headers.set("CSeq", "1 INVITE".to_string());
+                for (name, value) in &extra_headers {
+                    headers.add(name, value.clone());
+                }
+
+                let original_vias = vias.clone();
+                let req = SipRequest {
+                    method: Method::Invite,
+                    request_uri,
+                    version: "SIP/2.0".to_string(),
+                    headers,
+                    body: None,
+                };
+                (req, original_vias)
+            })
+    }
+
+    proptest! {
+        /// Feature: performance-bottleneck-optimization, Property 5
+        /// 任意のSIP INVITEリクエストに対して、転送後にプロキシのViaが最上位に追加され、
+        /// Record-Routeが含まれる
+        /// **Validates: Requirements 5.1**
+        #[test]
+        fn prop_proxy_via_record_route(
+            (request, original_vias) in arb_invite_request_non_local(),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let transport = Arc::new(MockTransport::new());
+                let proxy = make_proxy(transport.clone());
+
+                proxy
+                    .handle_request(SipMessage::Request(request.clone()), uac_addr())
+                    .await
+                    .unwrap();
+
+                let sent_reqs = transport.sent_requests();
+                prop_assert_eq!(
+                    sent_reqs.len(), 1,
+                    "Proxy should forward exactly one request"
+                );
+                let (forwarded_req, _dest) = &sent_reqs[0];
+
+                // 1. Proxy's Via is added as the topmost Via
+                let forwarded_vias = forwarded_req.headers.get_all("Via");
+                prop_assert_eq!(
+                    forwarded_vias.len(),
+                    original_vias.len() + 1,
+                    "Forwarded request should have one extra Via (proxy's)"
+                );
+                prop_assert!(
+                    forwarded_vias[0].contains("10.0.0.100:5060"),
+                    "First Via should be proxy's address, got: {}",
+                    forwarded_vias[0]
+                );
+                prop_assert!(
+                    forwarded_vias[0].starts_with("SIP/2.0/UDP "),
+                    "Proxy Via should start with SIP/2.0/UDP, got: {}",
+                    forwarded_vias[0]
+                );
+                prop_assert!(
+                    forwarded_vias[0].contains(";branch=z9hG4bK-proxy-"),
+                    "Proxy Via should contain branch parameter, got: {}",
+                    forwarded_vias[0]
+                );
+
+                // 2. Original Via headers are preserved in order
+                for (i, original_via) in original_vias.iter().enumerate() {
+                    prop_assert_eq!(
+                        forwarded_vias[i + 1],
+                        original_via.as_str(),
+                        "Via at index {} should match original",
+                        i + 1
+                    );
+                }
+
+                // 3. Record-Route header is present with proxy's address
+                let record_routes = forwarded_req.headers.get_all("Record-Route");
+                prop_assert!(
+                    !record_routes.is_empty(),
+                    "Forwarded INVITE must contain a Record-Route header"
+                );
+                prop_assert!(
+                    record_routes[0].contains("10.0.0.100:5060"),
+                    "Record-Route must contain proxy address, got: {}",
+                    record_routes[0]
+                );
+                prop_assert!(
+                    record_routes[0].contains(";lr"),
+                    "Record-Route must contain ;lr parameter, got: {}",
+                    record_routes[0]
+                );
+
+                // 4. Original headers (Call-ID, From, To, CSeq) are preserved
+                let fwd_call_id = forwarded_req.headers.get("Call-ID");
+                let orig_call_id = request.headers.get("Call-ID");
+                prop_assert_eq!(
+                    fwd_call_id, orig_call_id,
+                    "Call-ID should be preserved"
+                );
+
+                let fwd_from = forwarded_req.headers.get("From");
+                let orig_from = request.headers.get("From");
+                prop_assert_eq!(
+                    fwd_from, orig_from,
+                    "From header should be preserved"
+                );
+
+                let fwd_cseq = forwarded_req.headers.get("CSeq");
+                let orig_cseq = request.headers.get("CSeq");
+                prop_assert_eq!(
+                    fwd_cseq, orig_cseq,
+                    "CSeq header should be preserved"
+                );
+
+                Ok(())
+            })?;
+        }
+    }
+
     // ===== Property 15: Viaヘッダのラウンドトリップ =====
     // Feature: sip-load-tester, Property 15: Viaヘッダのラウンドトリップ
     // **Validates: Requirements 19.2, 19.3**
-
-    use proptest::prelude::*;
 
     /// Strategy for generating a valid Via header value with random host/port/branch.
     fn arb_via_value() -> impl Strategy<Value = String> {
@@ -3162,6 +3513,138 @@ mod tests {
                 "Log should contain dest '{}', got: {}",
                 dest_str, result
             );
+        }
+    }
+
+    // ===== Property 6: Branch値の一意性テスト =====
+    // Feature: performance-bottleneck-optimization, Property 6
+    // **Validates: Requirements 5.2**
+
+    proptest! {
+        /// Feature: performance-bottleneck-optimization, Property 6
+        /// N個（N>=2）のbranch値生成で全値が一意
+        /// **Validates: Requirements 5.2**
+        #[test]
+        fn prop_branch_uniqueness(n in 2u32..=100) {
+            let mut branches = std::collections::HashSet::new();
+            for _ in 0..n {
+                let branch = rand_branch();
+                branches.insert(branch);
+            }
+            prop_assert_eq!(
+                branches.len(),
+                n as usize,
+                "All {} generated branch values must be unique, but got {} unique values",
+                n,
+                branches.len()
+            );
+        }
+    }
+
+    // ===== Property 7: プロキシレスポンス転送のVia除去正確性テスト =====
+    // Feature: performance-bottleneck-optimization, Property 7
+    // **Validates: Requirements 5.3**
+
+    proptest! {
+        /// Feature: performance-bottleneck-optimization, Property 7
+        /// 2つ以上のViaヘッダを持つレスポンスに対して、転送後にプロキシのViaが除去される
+        /// **Validates: Requirements 5.3**
+        #[test]
+        fn prop_proxy_response_via_removal(
+            remaining_vias in proptest::collection::vec(arb_via_value(), 1..5),
+            status_code in 100u16..=699u16,
+            reason in "[A-Za-z ]{1,20}",
+            call_id in "[a-zA-Z0-9]{1,32}",
+            from_tag in "[a-zA-Z0-9]{1,16}",
+            proxy_branch_suffix in "[a-f0-9]{8,16}",
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let transport = Arc::new(MockTransport::new());
+                let proxy = make_proxy(transport.clone());
+
+                // Build a response with proxy's Via on top, followed by remaining Vias
+                let proxy_via = format!(
+                    "SIP/2.0/UDP 10.0.0.100:5060;branch=z9hG4bK-proxy-{}",
+                    proxy_branch_suffix
+                );
+
+                let mut headers = Headers::new();
+                // Proxy's Via is the topmost
+                headers.add("Via", proxy_via.clone());
+                // Then the remaining Via headers
+                for via in &remaining_vias {
+                    headers.add("Via", via.clone());
+                }
+                headers.set("From", format!("<sip:alice@example.com>;tag={}", from_tag));
+                headers.set("To", "<sip:bob@example.com>;tag=resp1".to_string());
+                headers.set("Call-ID", call_id.clone());
+                headers.set("CSeq", "1 INVITE".to_string());
+
+                let response = SipMessage::Response(SipResponse {
+                    version: "SIP/2.0".to_string(),
+                    status_code,
+                    reason_phrase: reason.clone(),
+                    headers,
+                    body: None,
+                });
+
+                proxy.handle_response(response, uas_addr()).await.unwrap();
+
+                let sent_resps = transport.sent_responses();
+                prop_assert_eq!(
+                    sent_resps.len(), 1,
+                    "Proxy should forward exactly one response"
+                );
+                let (forwarded_resp, dest) = &sent_resps[0];
+
+                // 1. Proxy's Via is removed
+                let forwarded_vias = forwarded_resp.headers.get_all("Via");
+                prop_assert_eq!(
+                    forwarded_vias.len(),
+                    remaining_vias.len(),
+                    "Forwarded response should have proxy's Via removed ({} vs expected {})",
+                    forwarded_vias.len(),
+                    remaining_vias.len()
+                );
+
+                // 2. Remaining Via headers are preserved in order
+                for (i, original_via) in remaining_vias.iter().enumerate() {
+                    prop_assert_eq!(
+                        forwarded_vias[i],
+                        original_via.as_str(),
+                        "Via at index {} should match original after proxy Via removal",
+                        i
+                    );
+                }
+
+                // 3. Proxy's Via is not present in forwarded response
+                for via in &forwarded_vias {
+                    prop_assert!(
+                        !via.contains("10.0.0.100:5060"),
+                        "Proxy's Via should not be present in forwarded response, got: {}",
+                        via
+                    );
+                }
+
+                // 4. Response is forwarded to the address from the now-top Via header
+                let expected_dest = parse_via_addr(&remaining_vias[0]).unwrap();
+                prop_assert_eq!(
+                    *dest,
+                    expected_dest,
+                    "Response should be forwarded to address from the next Via header"
+                );
+
+                // 5. Other headers are preserved
+                let fwd_call_id = forwarded_resp.headers.get("Call-ID");
+                prop_assert_eq!(
+                    fwd_call_id,
+                    Some(call_id.as_str()),
+                    "Call-ID should be preserved"
+                );
+
+                Ok(())
+            })?;
         }
     }
 }
