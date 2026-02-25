@@ -137,6 +137,18 @@ impl DialogManager {
         self.dialogs.iter().map(|entry| entry.key().clone()).collect()
     }
 
+    /// Forcefully remove all active dialogs and return the number removed.
+    pub fn force_remove_all(&self) -> usize {
+        let call_ids = self.all_call_ids();
+        let mut removed = 0;
+        for call_id in call_ids {
+            if self.remove_dialog(&call_id).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Collect Call-IDs of dialogs that have timed out.
     /// Only clones Call-IDs for dialogs where:
     /// - elapsed time since creation exceeds the timeout threshold
@@ -853,6 +865,81 @@ mod tests {
                         cid, i, d.state);
                 }
             }
+        }
+    }
+
+    // ===== Property-Based Tests: max_dialogs制限 =====
+    // Feature: performance-profiling-optimization, Property 5: max_dialogs制限の遵守
+    // **Validates: Requirements 4.3, 5.5**
+    //
+    // max_dialogs値Mに対してM個を超えるダイアログ作成要求で
+    // MaxDialogsReachedエラーが返り、failed_callsに計上されることを検証する。
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_max_dialogs_limit_enforced(
+            max_dialogs in 1usize..100,
+            extra_factor in 1usize..3,
+        ) {
+            let dm = DialogManager::new(max_dialogs);
+            let stats = crate::stats::StatsCollector::new();
+            let total_requests = max_dialogs + max_dialogs * extra_factor;
+
+            let mut success_count = 0usize;
+            let mut rejected_count = 0usize;
+
+            for _ in 0..total_requests {
+                match dm.create_dialog() {
+                    Ok(_) => {
+                        success_count += 1;
+                    }
+                    Err(SipLoadTestError::MaxDialogsReached(_)) => {
+                        stats.record_failure();
+                        rejected_count += 1;
+                    }
+                    Err(e) => {
+                        prop_assert!(false, "Unexpected error: {:?}", e);
+                    }
+                }
+            }
+
+            // Exactly M dialogs should be created successfully
+            prop_assert_eq!(
+                success_count, max_dialogs,
+                "Expected {} successful dialogs, got {}",
+                max_dialogs, success_count
+            );
+
+            // All excess requests should be rejected
+            let expected_rejected = total_requests - max_dialogs;
+            prop_assert_eq!(
+                rejected_count, expected_rejected,
+                "Expected {} rejected requests, got {}",
+                expected_rejected, rejected_count
+            );
+
+            // DialogManager should never exceed max_dialogs
+            prop_assert!(
+                dm.active_count() <= max_dialogs,
+                "active_count {} exceeds max_dialogs {}",
+                dm.active_count(), max_dialogs
+            );
+
+            // StatsCollector should have recorded all rejections as failures
+            let snap = stats.snapshot();
+            prop_assert_eq!(
+                snap.failed_calls, rejected_count as u64,
+                "failed_calls {} should equal rejected_count {}",
+                snap.failed_calls, rejected_count
+            );
+
+            // total_calls should equal failed_calls (no successful calls recorded in stats)
+            prop_assert_eq!(
+                snap.total_calls, snap.failed_calls,
+                "total_calls {} should equal failed_calls {} (only failures recorded)",
+                snap.total_calls, snap.failed_calls
+            );
         }
     }
 }

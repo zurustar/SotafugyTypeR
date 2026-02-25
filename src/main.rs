@@ -109,6 +109,7 @@ async fn run_load_test(
         local_addr: std::net::SocketAddr::new(uac_addr, cfg.uac_port),
         call_duration: Duration::from_secs(cfg.call_duration),
         dialog_timeout: Duration::from_secs(32),
+        session_expires: Duration::from_secs(cfg.session_expires),
     };
 
     let mut uac = Uac::new(
@@ -259,5 +260,36 @@ mod tests {
         // Should NOT return within 50ms since flag stays false
         let result = tokio::time::timeout(Duration::from_millis(50), wait_for_shutdown(&flag)).await;
         assert!(result.is_err(), "wait_for_shutdown should not return while flag is false");
+    }
+
+    #[test]
+    fn test_config_session_expires_converts_to_uac_config_duration() {
+        // Requirement 2.2: Config.session_expires (u64) should be converted to UacConfig.session_expires (Duration)
+        let cfg = sip_load_test::config::Config {
+            session_expires: 600,
+            ..Default::default()
+        };
+        let uac_config = UacConfig {
+            proxy_addr: "127.0.0.1:5060".parse().unwrap(),
+            local_addr: "127.0.0.1:5060".parse().unwrap(),
+            call_duration: Duration::from_secs(cfg.call_duration),
+            dialog_timeout: Duration::from_secs(32),
+            session_expires: Duration::from_secs(cfg.session_expires),
+        };
+        assert_eq!(uac_config.session_expires, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_config_default_session_expires_converts_to_300_seconds() {
+        // Requirement 2.2: Default Config.session_expires (300) converts to Duration::from_secs(300)
+        let cfg = sip_load_test::config::Config::default();
+        let uac_config = UacConfig {
+            proxy_addr: "127.0.0.1:5060".parse().unwrap(),
+            local_addr: "127.0.0.1:5060".parse().unwrap(),
+            call_duration: Duration::from_secs(cfg.call_duration),
+            dialog_timeout: Duration::from_secs(32),
+            session_expires: Duration::from_secs(cfg.session_expires),
+        };
+        assert_eq!(uac_config.session_expires, Duration::from_secs(300));
     }
 }

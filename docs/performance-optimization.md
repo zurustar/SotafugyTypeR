@@ -62,3 +62,72 @@ BYE送信を`tokio::time::interval`によるバッチ処理に変更。コール
 9. タイムアウト検出の正確性
 10. 構築メッセージのパース可能性
 11. ベンチマーク結果のJSONラウンドトリップ
+
+## パフォーマンスプロファイリングと最適化（第2フェーズ）
+
+### はじめに
+
+第1フェーズの最適化（ゼロコピーパース、ラウンドロビン送信、シャーディングバッファ等）に続き、samplyプロファイラによるボトルネック特定と段階的な最適化を実施しました。主にOrchestratorの送信ループとドレインフェーズに焦点を当て、max_stable_cpsの大幅な向上を目指しました。
+
+### 最適化領域
+
+| 領域 | 問題 | 対策 |
+|------|------|------|
+| ドレインフェーズ | 各ステップ終了時に最大20秒の固定待機が発生 | 早期終了判定（active_dialogs=0で即座に終了）、タイムアウト時の残存ダイアログ強制クリーンアップ |
+| コール送信 | send_invite/send_registerの逐次awaitでスループット制限 | tokio::JoinSetによる並行発行 |
+| 送信間隔計算 | calculate_send_intervalの粒度が粗くバースト送信に非対応 | 戻り値を`(Duration, u64)`タプルに変更し、高CPS時のバッチ送信に対応 |
+| ベンチマーク設定 | max_dialogs=500で高CPS時にMaxDialogsReached頻発 | CPSとcall_durationに基づく動的算出（`target_cps × call_duration × 2`以上） |
+| StatsCollector | 並行送信環境下での統計整合性が未検証 | 並行安全性の検証と保証 |
+| プロファイリング環境 | プロファイリング手順が未整備 | デバッグシンボル付きリリースビルドとsamplyプロファイリングスクリプト整備 |
+
+### 設計方針
+
+- プロファイリング駆動: samplyプロファイラでボトルネックを特定してから最適化を実施
+- 段階的改善: 各最適化を独立して適用・測定し、効果を定量的に検証
+- 後方互換性の維持: 既存のAPI・テストを壊さない範囲で最適化
+- TDDアプローチ: テストファーストで各最適化を実装
+
+### 主要な変更点
+
+#### プロファイリング環境整備
+
+`Cargo.toml`の`[profile.release]`に`debug = true`を追加し、リリースビルドにデバッグシンボルを含めるようにしました。`scripts/bench_profile.sh`を新規作成し、samplyプロファイラでラップしたベンチマーク実行をワンコマンドで行えるようにしました。
+
+#### ドレインフェーズ最適化
+
+`run_step`のドレインフェーズを改善しました。active_dialogsが0になった時点で即座にドレインを終了し、タイムアウト（`call_duration + shutdown_timeout`秒）時は残存ダイアログを強制クリーンアップします。`DialogManager::force_remove_all()`と`Orchestrator::force_cleanup_remaining_dialogs()`を新規追加し、クリーンアップされたダイアログはfailed_callsに計上されます。ドレインフェーズ中もshutdown_flagを確認し、シャットダウン要求があれば即座に終了します。
+
+#### コール送信の並行化
+
+送信ループ内のsend_invite/send_registerの逐次awaitを`tokio::JoinSet`による並行発行に変更しました。各コールは独立してエラーハンドリングされ、1つのコール失敗が他のコールに影響を与えません。OSスレッドを追加消費せず、tokioの非同期タスクのみで実現しています。
+
+#### 送信間隔計算の精度向上
+
+`calculate_send_interval`関数の戻り値を`Duration`から`(Duration, u64)`タプルに変更しました。高CPS（100以上）では10msインターバルでバッチ送信を行い、目標CPSに対して±5%以内の精度を実現します。CPS=0以下の場合はパニックせず安全なデフォルト値を返し、送信間隔は常に1ms〜100msの範囲内に収まります。
+
+#### ベンチマーク設定の最適化
+
+`bench_profile.sh`のベンチマーク設定パラメータを最適化しました。
+
+| パラメータ | 最適化前 | 最適化後 | 根拠 |
+|-----------|---------|---------|------|
+| max_dialogs | 500 | `target_cps × call_duration × 2`以上 | MaxDialogsReached防止 |
+| call_duration | 15s | 3〜5s | ベンチマーク高速化 |
+| shutdown_timeout | 5s | call_duration以下 | ドレイン時間短縮 |
+
+#### StatsCollectorの並行安全性保証
+
+並行送信環境下でのStatsCollectorの統計整合性を検証しました。複数の非同期タスクが同時にrecord_call/record_failureを呼び出しても全ての呼び出しが漏れなく記録され、`total_calls = successful_calls + failed_calls`の不変条件が維持されることを確認しています。
+
+### 正当性プロパティ
+
+以下のプロパティをproptestで検証済み:
+
+1. 強制クリーンアップの完全性: force_cleanup後にactive_dialogs=0、failed_callsにN加算
+2. 並行記録の完全性: N×Mの並行record_call呼び出しが全て記録される
+3. StatsCollectorのtotal_calls不変条件: total_calls = successful_calls + failed_calls
+4. コール失敗の独立性: k個のコール失敗が残りN-k個のコールに影響しない
+5. max_dialogs制限の遵守: M個を超えるダイアログ作成がMaxDialogsReachedエラーを返す
+6. 送信間隔の精度: 実効CPSが目標CPSの±5%以内
+7. 高CPSでのバッチ送信: CPS≥100でbatch_size>1
+8. 送信間隔の安全性: 任意のf64入力でパニックせず、intervalが1ms〜100ms範囲内

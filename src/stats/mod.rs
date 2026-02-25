@@ -815,4 +815,43 @@ mod tests {
             prop_assert_eq!(snap.failed_calls, 0);
         }
     }
+
+    // Feature: performance-profiling-optimization, Property 3: StatsCollectorのtotal_calls不変条件
+    // **Validates: Requirements 9.2**
+    //
+    // 任意のrecord_callとrecord_failureの操作列に対して、
+    // total_calls = successful_calls + failed_calls が常に成り立つことを検証する。
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_total_calls_invariant(
+            success_count in 0u64..500,
+            failure_count in 0u64..500,
+        ) {
+            let collector = StatsCollector::new();
+
+            for _ in 0..success_count {
+                collector.record_call(200, Duration::from_millis(10));
+            }
+            for _ in 0..failure_count {
+                collector.record_failure();
+            }
+
+            let snap = collector.snapshot();
+
+            prop_assert_eq!(
+                snap.total_calls,
+                snap.successful_calls + snap.failed_calls,
+                "total_calls invariant violated: total_calls={}, successful_calls={}, failed_calls={}",
+                snap.total_calls, snap.successful_calls, snap.failed_calls
+            );
+            prop_assert_eq!(snap.successful_calls, success_count,
+                "successful_calls mismatch: expected {}, got {}",
+                success_count, snap.successful_calls);
+            prop_assert_eq!(snap.failed_calls, failure_count,
+                "failed_calls mismatch: expected {}, got {}",
+                failure_count, snap.failed_calls);
+        }
+    }
 }

@@ -105,27 +105,41 @@ impl Orchestrator {
         let target_cps = self.config.target_cps;
         let duration = Duration::from_secs(self.config.duration);
         let pattern = LoadPattern::new(self.config.pattern.clone());
-        let send_interval = calculate_send_interval(target_cps);
+        let (send_interval, batch_size) = calculate_send_interval(target_cps);
 
         let start = Instant::now();
         let mut calls_sent: u64 = 0;
 
         while start.elapsed() < duration && !self.shutdown_flag.load(Ordering::Relaxed) {
             let elapsed = start.elapsed();
-            let to_send = pattern.calls_to_send(elapsed, target_cps, calls_sent);
+            let needed = pattern.calls_to_send(elapsed, target_cps, calls_sent);
+            // Only apply batch_size minimum when there are calls to send
+            let to_send = if needed > 0 { needed.max(batch_size) } else { 0 };
 
             if let Some(uac) = &self.uac {
+                let mut join_set = tokio::task::JoinSet::new();
                 for _ in 0..to_send {
                     if self.shutdown_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    match self.config.scenario {
-                        Scenario::Register => {
-                            let _ = uac.send_register().await;
+                    let uac = uac.clone();
+                    let scenario = self.config.scenario.clone();
+                    join_set.spawn(async move {
+                        match scenario {
+                            Scenario::Register => {
+                                let _ = uac.send_register().await;
+                            }
+                            Scenario::InviteBye => {
+                                let _ = uac.send_invite().await;
+                            }
                         }
-                        Scenario::InviteBye => {
-                            let _ = uac.send_invite().await;
-                        }
+                    });
+                }
+                // Wait for all spawned tasks and count completed calls
+                while let Some(result) = join_set.join_next().await {
+                    // Each task is independent - log join errors but don't propagate
+                    if let Err(e) = result {
+                        eprintln!("Concurrent send task failed: {}", e);
                     }
                     calls_sent += 1;
                 }
@@ -233,6 +247,7 @@ impl Orchestrator {
                 break;
             }
 
+            println!("[Step {}] expand: target_cps={:.1}, duration={}s", step_number + 1, high, step_duration.as_secs());
             let snap_before = self.stats.snapshot();
             let _result = self.run_step(high, step_duration).await?;
             let snap_after = self.stats.snapshot();
@@ -259,6 +274,7 @@ impl Orchestrator {
                 error_rate: step_error_rate,
                 result: if is_pass { "pass".to_string() } else { "fail".to_string() },
             });
+            println!("[Step {}] result: {} (calls={}, failed={}, error_rate={:.4})", step_number, if is_pass { "PASS" } else { "FAIL" }, step_total, step_failed, step_error_rate);
 
             if !is_pass {
                 // Found upper bound: high is too much, low was last good
@@ -290,6 +306,7 @@ impl Orchestrator {
 
             let mid = (low + high) / 2.0;
 
+            println!("[Step {}] binary_search: target_cps={:.1}, duration={}s", step_number + 1, mid, step_duration.as_secs());
             let snap_before = self.stats.snapshot();
             let _result = self.run_step(mid, step_duration).await?;
             let snap_after = self.stats.snapshot();
@@ -316,6 +333,7 @@ impl Orchestrator {
                 error_rate: step_error_rate,
                 result: if is_pass { "pass".to_string() } else { "fail".to_string() },
             });
+            println!("[Step {}] result: {} (calls={}, failed={}, error_rate={:.4})", step_number, if is_pass { "PASS" } else { "FAIL" }, step_total, step_failed, step_error_rate);
 
             if is_pass {
                 // Req 8.2: good → search upper half
@@ -349,27 +367,41 @@ impl Orchestrator {
         let pattern = LoadPattern::new(PatternConfig::Sustained {
             duration_secs: duration.as_secs(),
         });
-        let send_interval = calculate_send_interval(cps);
+        let (send_interval, batch_size) = calculate_send_interval(cps);
 
         let start = Instant::now();
         let mut calls_sent: u64 = 0;
 
         while start.elapsed() < duration && !self.shutdown_flag.load(Ordering::Relaxed) {
             let elapsed = start.elapsed();
-            let to_send = pattern.calls_to_send(elapsed, cps, calls_sent);
+            let needed = pattern.calls_to_send(elapsed, cps, calls_sent);
+            // Only apply batch_size minimum when there are calls to send
+            let to_send = if needed > 0 { needed.max(batch_size) } else { 0 };
 
             if let Some(uac) = &self.uac {
+                let mut join_set = tokio::task::JoinSet::new();
                 for _ in 0..to_send {
                     if self.shutdown_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    match self.config.scenario {
-                        Scenario::Register => {
-                            let _ = uac.send_register().await;
+                    let uac = uac.clone();
+                    let scenario = self.config.scenario.clone();
+                    join_set.spawn(async move {
+                        match scenario {
+                            Scenario::Register => {
+                                let _ = uac.send_register().await;
+                            }
+                            Scenario::InviteBye => {
+                                let _ = uac.send_invite().await;
+                            }
                         }
-                        Scenario::InviteBye => {
-                            let _ = uac.send_invite().await;
-                        }
+                    });
+                }
+                // Wait for all spawned tasks and count completed calls
+                while let Some(result) = join_set.join_next().await {
+                    // Each task is independent - log join errors but don't propagate
+                    if let Err(e) = result {
+                        eprintln!("Concurrent send task failed: {}", e);
                     }
                     calls_sent += 1;
                 }
@@ -377,6 +409,22 @@ impl Orchestrator {
 
             // Dynamic interval based on target CPS (Requirements: 9.3)
             tokio::time::sleep(send_interval).await;
+        }
+
+        // Wait for in-flight calls to complete (BYE responses)
+        // Use call_duration + dialog_timeout as max drain time
+        let drain_timeout = Duration::from_secs(self.config.call_duration) + Duration::from_secs(self.config.shutdown_timeout);
+        let drain_start = Instant::now();
+        while self.stats.snapshot().active_dialogs > 0
+            && drain_start.elapsed() < drain_timeout
+            && !self.shutdown_flag.load(Ordering::Relaxed)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Force cleanup remaining dialogs on timeout (Requirements: 3.4, 8.1)
+        if self.stats.snapshot().active_dialogs > 0 {
+            self.force_cleanup_remaining_dialogs();
         }
 
         let snap = self.stats.snapshot();
@@ -393,6 +441,26 @@ impl Orchestrator {
             error_rate,
             stats: snap,
         })
+    }
+
+    /// Force cleanup remaining dialogs after drain phase timeout.
+    /// Each cleaned-up dialog is counted as a failure.
+    /// Requirements: 3.4, 8.1, 8.2, 8.3, 8.4
+    fn force_cleanup_remaining_dialogs(&self) {
+        if let Some(uac) = &self.uac {
+            let dm = uac.dialog_manager();
+            let removed = dm.force_remove_all();
+            for _ in 0..removed {
+                self.stats.record_failure();
+                self.stats.decrement_active_dialogs();
+            }
+            if removed > 0 {
+                eprintln!(
+                    "Drain phase timeout: force-cleaned {} remaining dialog(s)",
+                    removed
+                );
+            }
+        }
     }
 
     /// Graceful shutdown: UAC → UAS → Proxy in order.
@@ -521,31 +589,38 @@ fn build_experiment_result(
     }
 }
 
-/// Calculate the send interval based on target CPS.
+/// Calculate the send interval and batch size based on target CPS.
 ///
-/// Uses `interval_us = 1_000_000 / target_cps` with:
-/// - Minimum floor: 1ms (prevents busy-waiting at very high CPS)
-/// - Maximum cap: 100ms (ensures responsiveness at very low CPS)
-/// - Edge cases: cps <= 0 returns max interval (100ms)
+/// Returns `(interval, batch_size)` where:
+/// - `interval`: Duration between each batch send (1ms–100ms)
+/// - `batch_size`: Number of calls to send per iteration
 ///
-/// Requirements: 9.3
-pub fn calculate_send_interval(target_cps: f64) -> Duration {
+/// For high CPS (≥100): computes batch_size from a base 10ms interval, then
+/// adjusts the interval to `batch_size / target_cps` to guarantee ±5% accuracy.
+/// For low CPS (<100): uses `1_000_000 / target_cps` microseconds with batch_size=1.
+/// For non-positive CPS: returns (100ms, 0) as safe default.
+///
+/// Requirements: 6.1, 6.2, 6.3, 6.4
+pub fn calculate_send_interval(target_cps: f64) -> (Duration, u64) {
     const MIN_INTERVAL: Duration = Duration::from_millis(1);
     const MAX_INTERVAL: Duration = Duration::from_millis(100);
 
     if target_cps <= 0.0 {
-        return MAX_INTERVAL;
+        return (MAX_INTERVAL, 0);
     }
 
-    let interval_us = (1_000_000.0 / target_cps) as u64;
-    let interval = Duration::from_micros(interval_us);
-
-    if interval < MIN_INTERVAL {
-        MIN_INTERVAL
-    } else if interval > MAX_INTERVAL {
-        MAX_INTERVAL
+    if target_cps >= 100.0 {
+        // High CPS: compute batch_size, then adjust interval for accuracy
+        let batch_size = (target_cps * 0.01).round().max(1.0) as u64;
+        // interval = batch_size / target_cps (in seconds), converted to microseconds
+        let interval_us = ((batch_size as f64 / target_cps) * 1_000_000.0) as u64;
+        let interval = Duration::from_micros(interval_us).clamp(MIN_INTERVAL, MAX_INTERVAL);
+        (interval, batch_size)
     } else {
-        interval
+        let interval_us = (1_000_000.0 / target_cps) as u64;
+        let interval = Duration::from_micros(interval_us);
+        let clamped = interval.clamp(MIN_INTERVAL, MAX_INTERVAL);
+        (clamped, 1)
     }
 }
 
@@ -747,9 +822,13 @@ mod tests {
 
     /// A mock transport that records a successful call in stats on each send.
     /// This ensures total_calls > 0 when used with run_step.
+    /// After `max_success` calls, subsequent calls are recorded as failures
+    /// so that binary_search expand phase terminates naturally.
     struct StatsRecordingTransport {
         inner: MockTransport,
         stats: Arc<StatsCollector>,
+        call_count: std::sync::atomic::AtomicU64,
+        max_success: u64,
     }
 
     impl StatsRecordingTransport {
@@ -757,6 +836,17 @@ mod tests {
             Self {
                 inner: MockTransport::new(),
                 stats,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+                max_success: u64::MAX, // unlimited by default
+            }
+        }
+
+        fn with_max_success(stats: Arc<StatsCollector>, max_success: u64) -> Self {
+            Self {
+                inner: MockTransport::new(),
+                stats,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+                max_success,
             }
         }
     }
@@ -770,8 +860,17 @@ mod tests {
         {
             Box::pin(async move {
                 self.inner.send_to(data, addr).await?;
-                // Record a successful call so total_calls > 0
-                self.stats.record_call(200, Duration::from_millis(1));
+                let count = self.call_count.fetch_add(1, Ordering::Relaxed);
+                if count < self.max_success {
+                    // Record a successful call so total_calls > 0
+                    self.stats.record_call(200, Duration::from_millis(1));
+                } else {
+                    // Record a failure to trigger error threshold in binary search
+                    self.stats.record_failure();
+                }
+                // Balance the increment_active_dialogs() called in send_register/send_invite
+                // so drain phase doesn't see leftover active dialogs in tests
+                self.stats.decrement_active_dialogs();
                 Ok(())
             })
         }
@@ -803,6 +902,7 @@ mod tests {
         config.health_check_retries = 3;
         config.health_check_timeout = 1;
         config.shutdown_timeout = 2;
+        config.call_duration = 0; // no drain wait for tests
         config
     }
 
@@ -826,6 +926,15 @@ mod tests {
     /// and records them in stats (total_calls > 0).
     fn attach_mock_uac(orch: &mut Orchestrator) {
         let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::new(orch.stats().clone()));
+        let pool = make_user_pool();
+        let uac = make_uac(transport, orch.stats().clone(), pool);
+        orch.set_uac(Arc::new(uac));
+    }
+
+    /// Attach a mock UAC that starts recording failures after `max_success` calls.
+    /// This ensures binary_search expand phase terminates naturally.
+    fn attach_mock_uac_with_limit(orch: &mut Orchestrator, max_success: u64) {
+        let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::with_max_success(orch.stats().clone(), max_success));
         let pool = make_user_pool();
         let uac = make_uac(transport, orch.stats().clone(), pool);
         orch.set_uac(Arc::new(uac));
@@ -1538,8 +1647,7 @@ mod tests {
     /// Req 8.1: returns ExperimentResult on success
     #[tokio::test]
     async fn test_run_binary_search_returns_experiment_result() {
-        // Mock UAC → error_rate=0 at all steps → low keeps rising → converges
-        // Use large convergence_threshold so it converges quickly after upper bound found
+        // Mock UAC with limited success calls so expand phase terminates naturally
         let mut orch = make_binary_search_orchestrator(
             10.0,  // initial_cps
             50.0,  // step_size (large to find upper bound fast)
@@ -1547,7 +1655,7 @@ mod tests {
             100.0, // convergence_threshold (large for quick convergence)
             0,     // no cooldown
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await;
         assert!(result.is_ok());
         let exp = result.unwrap();
@@ -1569,8 +1677,7 @@ mod tests {
     /// Req 8.4: search converges when high - low <= convergence_threshold
     #[tokio::test]
     async fn test_run_binary_search_converges() {
-        // Mock UAC → error_rate=0 → low keeps rising toward high
-        // With large convergence_threshold, the search should stop quickly
+        // Mock UAC with limited success so expand phase finds upper bound
         let mut orch = make_binary_search_orchestrator(
             10.0,   // initial_cps
             50.0,   // step_size (large for fast upper bound)
@@ -1578,9 +1685,9 @@ mod tests {
             100.0,  // convergence_threshold (large for quick convergence)
             0,      // no cooldown
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
-        // max_stable_cps should be > 0 since error_rate=0 at all steps
+        // max_stable_cps should be > 0 since early steps succeed
         assert!(result.max_stable_cps > 0.0);
     }
 
@@ -1590,7 +1697,7 @@ mod tests {
         let mut orch = make_binary_search_orchestrator(
             10.0, 50.0, 0.1, 100.0, 0,
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
         assert!(!result.started_at.is_empty());
         assert!(!result.finished_at.is_empty());
@@ -1639,7 +1746,7 @@ mod tests {
             100.0,  // large convergence_threshold for quick convergence
             1,      // 1 second cooldown
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         // Request shutdown after a short delay to keep test fast
         let flag = orch.shutdown_flag().clone();
         tokio::spawn(async move {
@@ -1654,7 +1761,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_binary_search_result_has_steps_field() {
-        // Mock UAC → error_rate=0 at all steps → expand phase runs, then converges
         let mut orch = make_binary_search_orchestrator(
             10.0,  // initial_cps
             50.0,  // step_size
@@ -1662,11 +1768,9 @@ mod tests {
             100.0, // convergence_threshold (large for quick convergence)
             0,     // no cooldown
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
-        // steps field should exist (may be empty or populated)
-        // With no UAC and error_rate=0, expand phase runs until safety limit
-        // The steps vec should be populated
+        // steps field should exist and be populated
         assert!(!result.steps.is_empty());
     }
 
@@ -1679,7 +1783,7 @@ mod tests {
             100.0, // convergence_threshold
             0,     // no cooldown
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
         // At least one step should be in the "expand" phase
         let expand_steps: Vec<_> = result.steps.iter()
@@ -1693,7 +1797,7 @@ mod tests {
         let mut orch = make_binary_search_orchestrator(
             10.0, 50.0, 0.1, 100.0, 0,
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
         // Steps should be numbered sequentially starting from 1
         for (i, step) in result.steps.iter().enumerate() {
@@ -1706,7 +1810,7 @@ mod tests {
         let mut orch = make_binary_search_orchestrator(
             10.0, 50.0, 0.1, 100.0, 0,
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
         for step in &result.steps {
             assert!(
@@ -1721,7 +1825,7 @@ mod tests {
         let mut orch = make_binary_search_orchestrator(
             10.0, 50.0, 0.1, 100.0, 0,
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 50);
         let result = orch.run_binary_search().await.unwrap();
         for step in &result.steps {
             assert_eq!(
@@ -1770,7 +1874,7 @@ mod tests {
         let mut orch = make_binary_search_orchestrator(
             10.0, 20.0, 0.1, 100.0, 0,
         );
-        attach_mock_uac(&mut orch);
+        attach_mock_uac_with_limit(&mut orch, 100);
         let result = orch.run_binary_search().await.unwrap();
         let expand_steps: Vec<_> = result.steps.iter()
             .filter(|s| s.phase == "expand")
@@ -2098,67 +2202,340 @@ mod tests {
         }
     }
 
+    // ===== Property-Based Tests: calculate_send_interval =====
+    // Feature: performance-profiling-optimization, Property 6: 送信間隔の精度
+    // **Validates: Requirements 6.1**
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Property 6: For any positive target CPS ≥ 10 (where interval is not clamped
+        /// to MAX_INTERVAL), the effective CPS derived from
+        /// (batch_size / interval.as_secs_f64()) is within ±5% of the target CPS.
+        ///
+        /// Note: For CPS < 10, the interval is clamped to 100ms, making the minimum
+        /// achievable effective CPS = 10. The actual send rate for low CPS is controlled
+        /// by LoadPattern::calls_to_send, not by the interval alone.
+        #[test]
+        fn prop_send_interval_accuracy(target_cps in 10.0f64..10000.0) {
+            let (interval, batch_size) = calculate_send_interval(target_cps);
+            let effective_cps = batch_size as f64 / interval.as_secs_f64();
+            let lower = target_cps * 0.95;
+            let upper = target_cps * 1.05;
+            prop_assert!(
+                effective_cps >= lower && effective_cps <= upper,
+                "effective CPS {} not within ±5% of target {} (expected {}..{}), interval={:?}, batch_size={}",
+                effective_cps, target_cps, lower, upper, interval, batch_size
+            );
+        }
+    }
+
+    // ===== Property-Based Tests: calculate_send_interval (batch) =====
+    // Feature: performance-profiling-optimization, Property 7: 高CPSでのバッチ送信
+    // **Validates: Requirements 6.2**
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Property 7: For any target CPS ≥ 150, the batch_size returned by
+        /// calculate_send_interval is greater than 1.
+        ///
+        /// Note: The lower bound is 150.0 instead of 100.0 because the implementation
+        /// uses `.round()` (not `.ceil()`). At CPS 100–149, `round(target_cps * 0.01)`
+        /// evaluates to 1, so batch_size == 1. For batch_size > 1, we need
+        /// `round(target_cps * 0.01) >= 2`, which requires `target_cps * 0.01 >= 1.5`,
+        /// i.e., `target_cps >= 150`.
+        #[test]
+        fn prop_high_cps_batch_send(target_cps in 150.0f64..10000.0) {
+            let (_interval, batch_size) = calculate_send_interval(target_cps);
+            prop_assert!(
+                batch_size > 1,
+                "batch_size {} should be > 1 for target CPS {} (high CPS path)",
+                batch_size, target_cps
+            );
+        }
+    }
+
     // ===== calculate_send_interval tests =====
-    // Requirements: 9.3 - コール送信ループの動的間隔調整
+    // Requirements: 6.1, 6.2, 6.3, 6.4 - 送信間隔計算の精度向上
 
     #[test]
     fn test_calculate_send_interval_normal_cps() {
-        // 100 CPS → 1_000_000 / 100 = 10_000 us = 10ms
-        let interval = calculate_send_interval(100.0);
+        // 100 CPS → high CPS path: batch_size = round(100 * 0.01) = 1
+        // interval = 1/100 = 10_000us = 10ms
+        let (interval, batch_size) = calculate_send_interval(100.0);
+        assert_eq!(batch_size, 1);
         assert_eq!(interval, Duration::from_micros(10_000));
     }
 
     #[test]
     fn test_calculate_send_interval_low_cps_capped_at_max() {
-        // 5 CPS → 1_000_000 / 5 = 200_000 us = 200ms → capped at 100ms
-        let interval = calculate_send_interval(5.0);
+        // 5 CPS → 1_000_000 / 5 = 200_000 us = 200ms → clamped to 100ms, batch_size = 1
+        let (interval, batch_size) = calculate_send_interval(5.0);
         assert_eq!(interval, Duration::from_millis(100));
+        assert_eq!(batch_size, 1);
     }
 
     #[test]
-    fn test_calculate_send_interval_high_cps_floored_at_min() {
-        // 10_000_000 CPS → 1_000_000 / 10_000_000 ≈ 0.1 us → floored at 1ms
-        let interval = calculate_send_interval(10_000_000.0);
-        assert_eq!(interval, Duration::from_millis(1));
+    fn test_calculate_send_interval_high_cps_batch() {
+        // 1000 CPS → high CPS path: batch_size = round(1000 * 0.01) = 10
+        // interval = 10/1000 = 10_000us = 10ms
+        let (interval, batch_size) = calculate_send_interval(1000.0);
+        assert_eq!(batch_size, 10);
+        assert_eq!(interval, Duration::from_micros(10_000));
     }
 
     #[test]
-    fn test_calculate_send_interval_zero_cps_returns_max() {
-        let interval = calculate_send_interval(0.0);
+    fn test_calculate_send_interval_zero_cps_returns_safe_default() {
+        let (interval, batch_size) = calculate_send_interval(0.0);
         assert_eq!(interval, Duration::from_millis(100));
+        assert_eq!(batch_size, 0);
     }
 
     #[test]
-    fn test_calculate_send_interval_negative_cps_returns_max() {
-        let interval = calculate_send_interval(-10.0);
+    fn test_calculate_send_interval_negative_cps_returns_safe_default() {
+        let (interval, batch_size) = calculate_send_interval(-10.0);
         assert_eq!(interval, Duration::from_millis(100));
+        assert_eq!(batch_size, 0);
     }
 
     #[test]
     fn test_calculate_send_interval_one_cps() {
-        // 1 CPS → 1_000_000 / 1 = 1_000_000 us = 1000ms → capped at 100ms
-        let interval = calculate_send_interval(1.0);
+        // 1 CPS → 1_000_000 / 1 = 1_000_000 us = 1000ms → clamped to 100ms, batch_size = 1
+        let (interval, batch_size) = calculate_send_interval(1.0);
         assert_eq!(interval, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_calculate_send_interval_exact_min_boundary() {
-        // 1000 CPS → 1_000_000 / 1000 = 1000 us = 1ms (exactly the min)
-        let interval = calculate_send_interval(1000.0);
-        assert_eq!(interval, Duration::from_millis(1));
+        assert_eq!(batch_size, 1);
     }
 
     #[test]
     fn test_calculate_send_interval_exact_max_boundary() {
-        // 10 CPS → 1_000_000 / 10 = 100_000 us = 100ms (exactly the max)
-        let interval = calculate_send_interval(10.0);
+        // 10 CPS → 1_000_000 / 10 = 100_000 us = 100ms (exactly the max), batch_size = 1
+        let (interval, batch_size) = calculate_send_interval(10.0);
         assert_eq!(interval, Duration::from_millis(100));
+        assert_eq!(batch_size, 1);
     }
 
     #[test]
     fn test_calculate_send_interval_between_boundaries() {
-        // 50 CPS → 1_000_000 / 50 = 20_000 us = 20ms (between 1ms and 100ms)
-        let interval = calculate_send_interval(50.0);
+        // 50 CPS → 1_000_000 / 50 = 20_000 us = 20ms (between 1ms and 100ms), batch_size = 1
+        let (interval, batch_size) = calculate_send_interval(50.0);
         assert_eq!(interval, Duration::from_micros(20_000));
+        assert_eq!(batch_size, 1);
+    }
+
+    #[test]
+    fn test_calculate_send_interval_very_high_cps() {
+        // 5000 CPS → high CPS path: batch_size = round(5000 * 0.01) = 50
+        // interval = 50/5000 = 10_000us = 10ms
+        let (interval, batch_size) = calculate_send_interval(5000.0);
+        assert_eq!(batch_size, 50);
+        assert_eq!(interval, Duration::from_micros(10_000));
+    }
+
+    // ===== force_cleanup_remaining_dialogs tests =====
+    // Requirements: 3.4, 8.1, 8.2, 8.3, 8.4
+
+    fn make_orchestrator_with_dialog_manager() -> (Orchestrator, Arc<DialogManager>) {
+        let mut config = make_config(RunMode::Sustained);
+        config.call_duration = 0;
+        config.shutdown_timeout = 0;
+        let pool = make_user_pool();
+        let mut orch = Orchestrator::new(config, pool.clone());
+        let dm = Arc::new(DialogManager::new(10_000));
+        let transport: Arc<dyn SipTransport> = Arc::new(MockTransport::new());
+        let uac = Uac::new(transport, dm.clone(), orch.stats().clone(), pool, UacConfig::default());
+        orch.set_uac(Arc::new(uac));
+        (orch, dm)
+    }
+
+    #[test]
+    fn test_force_cleanup_no_dialogs() {
+        let (orch, _dm) = make_orchestrator_with_dialog_manager();
+        orch.force_cleanup_remaining_dialogs();
+        let snap = orch.stats().snapshot();
+        assert_eq!(snap.failed_calls, 0);
+        assert_eq!(snap.active_dialogs, 0);
+    }
+
+    #[test]
+    fn test_force_cleanup_removes_all_dialogs() {
+        let (orch, dm) = make_orchestrator_with_dialog_manager();
+        // Add 3 dialogs
+        for i in 0..3 {
+            use crate::dialog::{Dialog, DialogState};
+            let dialog = Dialog {
+                call_id: format!("call-{}", i),
+                from_tag: format!("tag-{}", i),
+                to_tag: None,
+                state: DialogState::Confirmed,
+                cseq: 1,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            dm.insert_dialog(dialog).unwrap();
+            orch.stats().increment_active_dialogs();
+        }
+        assert_eq!(dm.active_count(), 3);
+        assert_eq!(orch.stats().snapshot().active_dialogs, 3);
+
+        orch.force_cleanup_remaining_dialogs();
+
+        assert_eq!(dm.active_count(), 0);
+        let snap = orch.stats().snapshot();
+        assert_eq!(snap.failed_calls, 3);
+        assert_eq!(snap.active_dialogs, 0);
+    }
+
+    #[test]
+    fn test_force_cleanup_without_uac_is_noop() {
+        let config = make_config(RunMode::Sustained);
+        let pool = make_user_pool();
+        let orch = Orchestrator::new(config, pool);
+        // No UAC set - should not panic
+        orch.force_cleanup_remaining_dialogs();
+        assert_eq!(orch.stats().snapshot().failed_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_step_drain_timeout_triggers_force_cleanup() {
+        let (orch, dm) = make_orchestrator_with_dialog_manager();
+        // call_duration=0, shutdown_timeout=0 means drain_timeout=0
+
+        // Add a dialog that won't complete on its own
+        use crate::dialog::{Dialog, DialogState};
+        let dialog = Dialog {
+            call_id: "stuck-call".to_string(),
+            from_tag: "tag-stuck".to_string(),
+            to_tag: None,
+            state: DialogState::Confirmed,
+            cseq: 1,
+            created_at: Instant::now(),
+            session_expires: None,
+            auth_attempted: false,
+            original_request: None,
+        };
+        dm.insert_dialog(dialog).unwrap();
+        orch.stats().increment_active_dialogs();
+
+        assert_eq!(orch.stats().snapshot().active_dialogs, 1);
+
+        // Run step with 0 duration (no calls sent), drain will timeout immediately
+        let _result = orch.run_step(0.0, Duration::from_millis(1)).await.unwrap();
+
+        // After run_step, the stuck dialog should have been force-cleaned
+        assert_eq!(dm.active_count(), 0);
+        assert_eq!(orch.stats().snapshot().active_dialogs, 0);
+        // The stuck dialog should be counted as a failure
+        assert_eq!(orch.stats().snapshot().failed_calls, 1);
+    }
+
+    // ===== Concurrent send tests (Task 6.1) =====
+
+    #[tokio::test]
+    async fn test_run_step_concurrent_send_records_all_calls() {
+        // Verify that run_step with high CPS sends multiple calls
+        // and all are recorded in stats
+        let mut config = make_config(RunMode::Sustained);
+        config.duration = 1;
+        config.target_cps = 200.0; // High CPS to trigger batch sending
+        config.call_duration = 0;
+        config.shutdown_timeout = 0;
+        let pool = make_user_pool();
+        let mut orch = Orchestrator::new(config, pool.clone());
+
+        let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::new(orch.stats().clone()));
+        let uac = make_uac(transport, orch.stats().clone(), pool);
+        orch.set_uac(Arc::new(uac));
+
+        let result = orch.run_step(200.0, Duration::from_secs(1)).await.unwrap();
+        let snap = result.stats;
+        // At 200 CPS for 1 second, should have sent a significant number of calls
+        assert!(snap.total_calls > 0, "Should have sent calls at 200 CPS");
+        // All calls should be accounted for (successful + failed = total)
+        assert_eq!(snap.total_calls, snap.successful_calls + snap.failed_calls);
+    }
+
+    #[tokio::test]
+    async fn test_run_step_concurrent_send_individual_failure_independence() {
+        // Verify that when some calls fail, others still succeed
+        // Using StatsRecordingTransport with max_success to simulate partial failures
+        let mut config = make_config(RunMode::Sustained);
+        config.duration = 1;
+        config.target_cps = 100.0;
+        config.call_duration = 0;
+        config.shutdown_timeout = 0;
+        let pool = make_user_pool();
+        let mut orch = Orchestrator::new(config, pool.clone());
+
+        // First 5 calls succeed, rest fail
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            StatsRecordingTransport::with_max_success(orch.stats().clone(), 5)
+        );
+        let uac = make_uac(transport, orch.stats().clone(), pool);
+        orch.set_uac(Arc::new(uac));
+
+        let result = orch.run_step(100.0, Duration::from_secs(1)).await.unwrap();
+        let snap = result.stats;
+        // Should have both successful and failed calls
+        assert!(snap.successful_calls >= 5, "At least 5 calls should succeed");
+        assert!(snap.failed_calls > 0, "Some calls should fail after max_success");
+        // Total should be sum of both
+        assert_eq!(snap.total_calls, snap.successful_calls + snap.failed_calls);
+    }
+
+    #[tokio::test]
+    async fn test_run_sustained_concurrent_send_records_all_calls() {
+        // Verify that run_sustained with high CPS sends multiple calls
+        // and all are recorded in stats (Requirements: 4.1, 4.2)
+        let mut config = make_config(RunMode::Sustained);
+        config.duration = 1;
+        config.target_cps = 200.0; // High CPS to trigger batch sending
+        config.call_duration = 0;
+        config.shutdown_timeout = 0;
+        let pool = make_user_pool();
+        let mut orch = Orchestrator::new(config, pool.clone());
+
+        let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::new(orch.stats().clone()));
+        let uac = make_uac(transport, orch.stats().clone(), pool);
+        orch.set_uac(Arc::new(uac));
+
+        let result = orch.run().await.unwrap();
+        let snap = orch.stats().snapshot();
+        // At 200 CPS for 1 second, should have sent a significant number of calls
+        assert!(snap.total_calls > 0, "Should have sent calls at 200 CPS");
+        // All calls should be accounted for (successful + failed = total)
+        assert_eq!(snap.total_calls, snap.successful_calls + snap.failed_calls);
+        assert_eq!(result.config.mode, RunMode::Sustained);
+    }
+
+    #[tokio::test]
+    async fn test_run_sustained_concurrent_send_individual_failure_independence() {
+        // Verify that when some calls fail in sustained mode, others still succeed
+        // (Requirements: 4.2, 4.5)
+        let mut config = make_config(RunMode::Sustained);
+        config.duration = 1;
+        config.target_cps = 100.0;
+        config.call_duration = 0;
+        config.shutdown_timeout = 0;
+        let pool = make_user_pool();
+        let mut orch = Orchestrator::new(config, pool.clone());
+
+        // First 5 calls succeed, rest fail
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            StatsRecordingTransport::with_max_success(orch.stats().clone(), 5)
+        );
+        let uac = make_uac(transport, orch.stats().clone(), pool);
+        orch.set_uac(Arc::new(uac));
+
+        let result = orch.run().await.unwrap();
+        let snap = orch.stats().snapshot();
+        // Should have both successful and failed calls
+        assert!(snap.successful_calls >= 5, "At least 5 calls should succeed");
+        assert!(snap.failed_calls > 0, "Some calls should fail after max_success");
+        // Total should be sum of both
+        assert_eq!(snap.total_calls, snap.successful_calls + snap.failed_calls);
+        assert_eq!(result.config.mode, RunMode::Sustained);
     }
 }

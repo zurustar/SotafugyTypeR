@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b0e8c6a82d9859257ea52fa511788f3b01853974b990d7392901eb8cbf6e495a # shrinks to initial_cps = 14.197874415350316, step_size = 1.8134456049903227, error_threshold = 0.01, convergence_threshold = 0.1, limit_cps = 194.9880114276072
+cc 9b4580e2166362fa508d1b66be4c7f36e12bcf1de2aeef0fc1cd76adfb2f5305 # shrinks to target_cps = 1.0

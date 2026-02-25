@@ -97,6 +97,7 @@ pub struct Config {
     pub mode: RunMode,
     pub step_up: Option<StepUpConfig>,
     pub binary_search: Option<BinarySearchConfig>,
+    pub session_expires: u64,
     pub transaction_t1_ms: Option<u64>,
     pub transaction_t2_ms: Option<u64>,
     pub transaction_t4_ms: Option<u64>,
@@ -130,6 +131,7 @@ impl Default for Config {
             mode: RunMode::default(),
             step_up: None,
             binary_search: None,
+            session_expires: 300,
             transaction_t1_ms: None,
             transaction_t2_ms: None,
             transaction_t4_ms: None,
@@ -160,6 +162,9 @@ impl Config {
         }
         if self.uas_port == 0 {
             errors.push("uas_port must be greater than 0".to_string());
+        }
+        if self.session_expires == 0 {
+            errors.push("session_expires must be greater than 0".to_string());
         }
 
         // StepUpモード時はstep_up設定が必須
@@ -471,6 +476,8 @@ pub mod generators {
             let tx_t2 = proptest::option::of(1000u64..10000);
             let tx_t4 = proptest::option::of(1000u64..10000);
             let tx_max = proptest::option::of(1usize..100000);
+            // Feature: bench-auth-session-timer, Property 1: Configラウンドトリップ（session_expires含む）
+            let session_expires = 1u64..=86400;
             (
                 Just(net),
                 Just(core),
@@ -483,9 +490,10 @@ pub mod generators {
                 tx_t2,
                 tx_t4,
                 tx_max,
+                session_expires,
             )
         })
-        .prop_map(|(net, core, timing, opt, mode, step_up, binary_search, tx_t1, tx_t2, tx_t4, tx_max)| Config {
+        .prop_map(|(net, core, timing, opt, mode, step_up, binary_search, tx_t1, tx_t2, tx_t4, tx_max, session_expires)| Config {
             proxy_host: net.0,
             proxy_port: net.1,
             uac_host: net.2,
@@ -514,6 +522,7 @@ pub mod generators {
             transaction_t2_ms: tx_t2,
             transaction_t4_ms: tx_t4,
             max_transactions: tx_max,
+            session_expires,
         })
     }
     /// Strategy for generating valid ProxyServerConfig
@@ -987,6 +996,36 @@ mod tests {
         config.duration = 0;
         let errors = config.validate().unwrap_err();
         assert!(errors.len() >= 3);
+    }
+
+    // ===== session_expires テスト =====
+
+    #[test]
+    fn test_config_default_session_expires_is_300() {
+        let config = Config::default();
+        assert_eq!(config.session_expires, 300);
+    }
+
+    #[test]
+    fn test_config_session_expires_json_missing_uses_default() {
+        let json = r#"{}"#;
+        let loaded = load_from_str(json).unwrap();
+        assert_eq!(loaded.session_expires, 300);
+    }
+
+    #[test]
+    fn test_config_session_expires_positive_value_preserved() {
+        let json = r#"{"session_expires": 600}"#;
+        let loaded = load_from_str(json).unwrap();
+        assert_eq!(loaded.session_expires, 600);
+    }
+
+    #[test]
+    fn test_validate_session_expires_zero() {
+        let mut config = Config::default();
+        config.session_expires = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("session_expires must be greater than 0")));
     }
 
     // ===== Serdeシリアライズ/デシリアライズテスト =====

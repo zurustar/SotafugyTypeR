@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === SIP Load Tester — Performance Benchmark ===
-# binary-search モードで最大安定 CPS を探索する
+# === SIP Load Tester — Performance Benchmark (with samply profiler) ===
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -15,6 +14,7 @@ BENCH_CFG="/tmp/bench_config.json"
 RESULT_FILE="/tmp/bench_result.json"
 PROXY_LOG="/tmp/bench_proxy.log"
 USERS_FILE="/tmp/bench_users.json"
+PROFILE_FILE="/tmp/profile.json"
 
 PROXY_PID=""
 
@@ -29,8 +29,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 1. Release build ---
-echo "=== Building (release) ==="
+# --- 1. Release build with debug symbols ---
+echo "=== Building (release + debug symbols) ==="
 cd "$PROJECT_DIR"
 cargo build --release 2>&1
 echo ""
@@ -101,9 +101,13 @@ fi
 echo "Proxy started (PID: $PROXY_PID)"
 echo ""
 
-# --- 4. Run benchmark ---
-echo "=== Running Benchmark (binary-search) ==="
-"$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
+# --- 4. Run benchmark with samply profiler ---
+echo "=== Running Benchmark with samply profiler ==="
+samply record --save-only -o "$PROFILE_FILE" -- "$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
+echo ""
+
+echo "Profile saved: $PROFILE_FILE"
+echo "(Open with: samply load $PROFILE_FILE)"
 echo ""
 
 # --- 5. Show results ---

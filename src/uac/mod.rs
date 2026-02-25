@@ -27,6 +27,7 @@ pub struct UacConfig {
     pub local_addr: SocketAddr,
     pub call_duration: Duration,
     pub dialog_timeout: Duration,
+    pub session_expires: Duration,
 }
 
 impl Default for UacConfig {
@@ -36,6 +37,7 @@ impl Default for UacConfig {
             local_addr: "127.0.0.1:5060".parse().unwrap(),
             call_duration: Duration::from_secs(3),
             dialog_timeout: Duration::from_secs(32),
+            session_expires: Duration::from_secs(300),
         }
     }
 }
@@ -98,10 +100,22 @@ impl Uac {
         }
     }
 
+    /// Get a reference to the dialog manager.
+    pub fn dialog_manager(&self) -> &Arc<DialogManager> {
+        &self.dialog_manager
+    }
+
     /// Send a REGISTER request. Selects the next user from UserPool via round-robin.
     pub async fn send_register(&self) -> Result<(), SipLoadTestError> {
         let user = self.user_pool.next_user();
-        let dialog = self.dialog_manager.create_dialog()?;
+        let dialog = match self.dialog_manager.create_dialog() {
+            Ok(d) => d,
+            Err(SipLoadTestError::MaxDialogsReached(_)) => {
+                self.stats.record_failure();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         let request = self.build_register_request(&dialog, user);
 
@@ -127,7 +141,14 @@ impl Uac {
     /// Send an INVITE request. Selects the next user from UserPool via round-robin.
     pub async fn send_invite(&self) -> Result<(), SipLoadTestError> {
         let user = self.user_pool.next_user();
-        let dialog = self.dialog_manager.create_dialog()?;
+        let dialog = match self.dialog_manager.create_dialog() {
+            Ok(d) => d,
+            Err(SipLoadTestError::MaxDialogsReached(_)) => {
+                self.stats.record_failure();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         let request = self.build_invite_request(&dialog, user);
 
@@ -481,6 +502,7 @@ impl Uac {
                             to_tag.as_deref(),
                             cseq + 1,
                             local_addr,
+                            proxy_addr,
                         );
                         let reinvite_bytes = format_sip_message(&SipMessage::Request(reinvite));
                         let _ = transport.send_to(&reinvite_bytes, proxy_addr).await;
@@ -707,6 +729,7 @@ impl Uac {
         headers.set("Call-ID", dialog.call_id.clone());
         headers.set("CSeq", build_cseq_value(dialog.cseq, "INVITE"));
         headers.set("Max-Forwards", "70".to_string());
+        headers.set("Session-Expires", self.config.session_expires.as_secs().to_string());
         headers.set("Content-Length", "0".to_string());
 
         SipRequest {
@@ -858,6 +881,7 @@ fn build_reinvite_request_static(
     to_tag: Option<&str>,
     cseq: u32,
     local_addr: SocketAddr,
+    proxy_addr: SocketAddr,
 ) -> SipRequest {
     let branch = crate::sip::generate_branch(call_id, cseq, "INVITE");
     let mut headers = Headers::new();
@@ -867,6 +891,7 @@ fn build_reinvite_request_static(
     headers.set("To", build_to_value_with_optional_tag("sip:uas@remote", to_tag));
     headers.set("CSeq", build_cseq_value(cseq, "INVITE"));
     headers.set("Max-Forwards", "70".to_string());
+    headers.set("Route", format!("<sip:{}>", proxy_addr));
     headers.set("Content-Length", "0".to_string());
 
     SipRequest {
@@ -977,6 +1002,7 @@ mod tests {
                 local_addr,
                 call_duration: Duration::from_secs(3),
                 dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(300),
             };
             let transport = Arc::new(MockTransport::new());
             let uac = Uac::new(
@@ -1029,6 +1055,7 @@ mod tests {
                 local_addr,
                 call_duration: Duration::from_secs(3),
                 dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(300),
             };
             let transport = Arc::new(MockTransport::new());
             let uac = Uac::new(
@@ -1079,6 +1106,7 @@ mod tests {
                 local_addr,
                 call_duration: Duration::from_secs(3),
                 dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(300),
             };
             let transport = Arc::new(MockTransport::new());
             let uac = Uac::new(
@@ -1136,7 +1164,7 @@ mod tests {
             from_tag in arb_from_tag(),
         ) {
             // After fix: build_reinvite_request_static receives local_addr and uses it in Via.
-            let request = build_reinvite_request_static(&call_id, &from_tag, None, 1, local_addr);
+            let request = build_reinvite_request_static(&call_id, &from_tag, None, 1, local_addr, proxy_addr);
 
             let via = request.headers.get("Via").expect("Via header must exist");
             let via_addr_str = extract_via_addr(&via);
@@ -1209,6 +1237,7 @@ mod tests {
                 local_addr: proxy_addr,
                 call_duration: Duration::from_secs(3),
                 dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(300),
             };
             let transport = Arc::new(MockTransport::new());
             let uac = Uac::new(
@@ -1293,6 +1322,7 @@ mod tests {
                 local_addr: proxy_addr,
                 call_duration: Duration::from_secs(3),
                 dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(300),
             };
             let transport = Arc::new(MockTransport::new());
             let uac = Uac::new(
@@ -1391,8 +1421,9 @@ mod tests {
             (cseq1, cseq2) in arb_distinct_cseq_pair(),
         ) {
             // Build an INVITE request
+            let proxy_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
             let invite = build_reinvite_request_static(
-                &call_id, &from_tag, Some("remote-tag"), cseq1, local_addr,
+                &call_id, &from_tag, Some("remote-tag"), cseq1, local_addr, proxy_addr,
             );
             // Build a BYE request with the same Call-ID but different CSeq
             let bye = build_bye_request_static(
@@ -1537,6 +1568,7 @@ mod tests {
         assert_eq!(config.local_addr, test_addr());
         assert_eq!(config.call_duration, Duration::from_secs(3));
         assert_eq!(config.dialog_timeout, Duration::from_secs(32));
+        assert_eq!(config.session_expires, Duration::from_secs(300));
     }
 
     #[test]
@@ -1546,10 +1578,12 @@ mod tests {
             local_addr: "10.0.0.2:5070".parse().unwrap(),
             call_duration: Duration::from_secs(10),
             dialog_timeout: Duration::from_secs(60),
+            session_expires: Duration::from_secs(600),
         };
         assert_eq!(config.proxy_addr.port(), 5080);
         assert_eq!(config.local_addr.port(), 5070);
         assert_eq!(config.call_duration, Duration::from_secs(10));
+        assert_eq!(config.session_expires, Duration::from_secs(600));
     }
 
     // ===== Uac construction tests =====
@@ -1560,6 +1594,14 @@ mod tests {
         let uac = make_uac(transport);
         // Just verify it constructs without panic
         assert_eq!(uac.config.proxy_addr, test_addr());
+    }
+
+    #[test]
+    fn test_uac_dialog_manager_accessor() {
+        let transport = Arc::new(MockTransport::new());
+        let (uac, dm, _stats) = make_uac_with_parts(transport);
+        // dialog_manager() should return the same Arc instance
+        assert!(Arc::ptr_eq(uac.dialog_manager(), &dm));
     }
 
     // ===== send_register tests =====
@@ -1760,6 +1802,52 @@ mod tests {
 
         let requests = transport.sent_requests();
         assert!(requests[0].request_uri.contains("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_send_invite_max_dialogs_reached_records_failure() {
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(1)); // max_dialogs = 1
+        let stats = Arc::new(StatsCollector::new());
+        let uac = Uac::new(
+            transport.clone(),
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            UacConfig::default(),
+        );
+
+        // First invite succeeds
+        uac.send_invite().await.unwrap();
+        assert_eq!(stats.snapshot().failed_calls, 0);
+
+        // Second invite hits max_dialogs - should record failure, not propagate error
+        let result = uac.send_invite().await;
+        assert!(result.is_ok());
+        assert_eq!(stats.snapshot().failed_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_register_max_dialogs_reached_records_failure() {
+        let transport = Arc::new(MockTransport::new());
+        let dm = Arc::new(DialogManager::new(1)); // max_dialogs = 1
+        let stats = Arc::new(StatsCollector::new());
+        let uac = Uac::new(
+            transport.clone(),
+            dm.clone(),
+            stats.clone(),
+            make_user_pool(),
+            UacConfig::default(),
+        );
+
+        // First register succeeds
+        uac.send_register().await.unwrap();
+        assert_eq!(stats.snapshot().failed_calls, 0);
+
+        // Second register hits max_dialogs - should record failure, not propagate error
+        let result = uac.send_register().await;
+        assert!(result.is_ok());
+        assert_eq!(stats.snapshot().failed_calls, 1);
     }
 
     // ===== handle_response tests =====
@@ -3086,6 +3174,75 @@ mod tests {
         }
     }
 
+    /// build_invite_request adds Session-Expires header with config value (Requirements 3.1, 3.2)
+    #[test]
+    fn test_build_invite_request_has_session_expires_header() {
+        let transport = Arc::new(MockTransport::new());
+        let config = UacConfig {
+            session_expires: Duration::from_secs(1800),
+            ..UacConfig::default()
+        };
+        let uac = Uac::new(
+            transport,
+            Arc::new(DialogManager::new(100)),
+            Arc::new(StatsCollector::new()),
+            make_user_pool(),
+            config,
+        );
+        let dialog = Dialog {
+            call_id: "test-session-expires".to_string(),
+            from_tag: "tag-se".to_string(),
+            to_tag: None,
+            state: DialogState::Trying,
+            cseq: 1,
+            created_at: Instant::now(),
+            session_expires: None,
+            auth_attempted: false,
+            original_request: None,
+        };
+        let user = UserEntry {
+            username: "alice".to_string(),
+            domain: "example.com".to_string(),
+            password: "pass".to_string(),
+        };
+
+        let request = uac.build_invite_request(&dialog, &user);
+
+        let session_expires = request.headers.get("Session-Expires")
+            .expect("Session-Expires header must be present");
+        assert_eq!(session_expires, "1800");
+    }
+
+    /// build_invite_request with default config has Session-Expires 300 (Requirements 3.1, 3.2)
+    #[test]
+    fn test_build_invite_request_default_session_expires() {
+        let transport = Arc::new(MockTransport::new());
+        let uac = make_uac(transport);
+        let dialog = Dialog {
+            call_id: "test-default-se".to_string(),
+            from_tag: "tag-dse".to_string(),
+            to_tag: None,
+            state: DialogState::Trying,
+            cseq: 1,
+            created_at: Instant::now(),
+            session_expires: None,
+            auth_attempted: false,
+            original_request: None,
+        };
+        let user = UserEntry {
+            username: "bob".to_string(),
+            domain: "sip.example.com".to_string(),
+            password: "secret".to_string(),
+        };
+
+        let request = uac.build_invite_request(&dialog, &user);
+
+        let session_expires = request.headers.get("Session-Expires")
+            .expect("Session-Expires header must be present");
+        assert_eq!(session_expires, "300");
+    }
+
+
     /// End-to-end: optimized build_ack_request produces parseable message
     #[test]
     fn test_optimized_ack_request_is_parseable() {
@@ -3130,7 +3287,8 @@ mod tests {
     #[test]
     fn test_optimized_reinvite_request_static_is_parseable() {
         let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
-        let request = build_reinvite_request_static("test-call-id-005", "tag005", Some("remote-tag"), 3, local_addr);
+        let proxy_addr: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let request = build_reinvite_request_static("test-call-id-005", "tag005", Some("remote-tag"), 3, local_addr, proxy_addr);
         let msg = SipMessage::Request(request);
         let bytes = format_sip_message(&msg);
         let parsed = parse_sip_message(&bytes).expect("Optimized re-INVITE must be parseable");
@@ -3143,6 +3301,19 @@ mod tests {
             }
             _ => panic!("Expected Request, got Response"),
         }
+    }
+
+    /// re-INVITE must include a Route header pointing to the proxy address
+    #[test]
+    fn test_reinvite_request_has_route_header() {
+        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let proxy_addr: SocketAddr = "192.168.1.1:5060".parse().unwrap();
+        let request = build_reinvite_request_static(
+            "call-route-test", "tag-route", Some("remote-tag"), 2, local_addr, proxy_addr,
+        );
+
+        let route = request.headers.get("Route").expect("Route header must exist");
+        assert_eq!(route, format!("<sip:{}>", proxy_addr));
     }
 
     // ===== Batch BYE loop tests =====
@@ -3795,6 +3966,77 @@ mod tests {
                     _ => prop_assert!(false, "Expected Request, got Response"),
                 }
             }
+        }
+    }
+
+    // ===== Feature: bench-auth-session-timer, Property 2: build_invite_requestのSession-Expiresヘッダ付与 =====
+    // **Validates: Requirements 3.1, 3.2**
+    //
+    // For all valid UacConfig (with arbitrary session_expires), Dialog, and UserEntry,
+    // build_invite_request must include a Session-Expires header whose value equals
+    // UacConfig.session_expires.as_secs() as a string.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn pbt_build_invite_request_session_expires_header(
+            (proxy_addr, local_addr) in arb_distinct_addr_pair(),
+            session_expires_secs in 1u64..=86400,
+            call_id in arb_call_id(),
+            from_tag in arb_from_tag(),
+            cseq in arb_cseq(),
+            username in arb_username(),
+            domain in arb_domain(),
+        ) {
+            let config = UacConfig {
+                proxy_addr,
+                local_addr,
+                call_duration: Duration::from_secs(3),
+                dialog_timeout: Duration::from_secs(32),
+                session_expires: Duration::from_secs(session_expires_secs),
+            };
+            let transport = Arc::new(MockTransport::new());
+            let uac = Uac::new(
+                transport,
+                Arc::new(DialogManager::new(100)),
+                Arc::new(StatsCollector::new()),
+                make_user_pool(),
+                config,
+            );
+            let dialog = Dialog {
+                call_id,
+                from_tag,
+                to_tag: None,
+                state: DialogState::Trying,
+                cseq,
+                created_at: Instant::now(),
+                session_expires: None,
+                auth_attempted: false,
+                original_request: None,
+            };
+            let user = UserEntry {
+                username,
+                domain,
+                password: "test_pass".to_string(),
+            };
+
+            let request = uac.build_invite_request(&dialog, &user);
+
+            // Assert: Session-Expires header must be present
+            let se_header = request.headers.get("Session-Expires");
+            prop_assert!(se_header.is_some(), "Session-Expires header must be present in INVITE request");
+
+            // Assert: Session-Expires value must match config
+            let se_value = se_header.unwrap();
+            let expected = session_expires_secs.to_string();
+            prop_assert_eq!(
+                se_value,
+                &expected,
+                "Session-Expires header value ({}) must equal UacConfig.session_expires.as_secs() ({})",
+                se_value,
+                expected
+            );
         }
     }
 }
