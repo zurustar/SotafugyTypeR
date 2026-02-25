@@ -280,6 +280,8 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
+    use super::*;
+    use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use proptest::prelude::*;
 
@@ -318,6 +320,85 @@ mod proptests {
                     max_count, min_count, n_sockets, n_sends
                 );
             }
+        }
+    }
+
+    /// Feature: proxy-parallel-recv, Property 2: 複数タスクからの同時 recv_from 呼び出しの安全性
+    /// **Validates: Requirements 1.3**
+    #[tokio::test]
+    async fn prop_concurrent_recv_from_is_safe() {
+        use futures::future::join_all;
+
+        for n_tasks in 2..=8 {
+            // 受信用トランスポート（全タスクで共有）
+            let receiver = Arc::new(
+                UdpTransport::bind(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 1)
+                    .await
+                    .expect("receiver bind"),
+            );
+            let recv_addr = receiver.sockets[0].local_addr().unwrap();
+
+            // 送信用ソケット
+            let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("sender bind");
+
+            // n_tasks 個のタスクを spawn し、同一の Arc<UdpTransport> に対して
+            // 同時に recv_from を呼び出す
+            let mut handles = Vec::with_capacity(n_tasks);
+            for task_id in 0..n_tasks {
+                let r = receiver.clone();
+                handles.push(tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        r.recv_from(0),
+                    )
+                    .await;
+                    (task_id, result)
+                }));
+            }
+
+            // 少し待ってから全タスクにメッセージを送信
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            for i in 0..n_tasks {
+                let msg = format!("msg-{}", i);
+                sender
+                    .send_to(msg.as_bytes(), recv_addr)
+                    .await
+                    .expect("send");
+            }
+
+            // 全タスクの完了を待機し、パニックやデータ破損がないことを検証
+            let results = join_all(handles).await;
+            let mut received_count = 0usize;
+            for join_result in &results {
+                let (_task_id, timeout_result) =
+                    join_result.as_ref().expect("task must not panic");
+                match timeout_result {
+                    Ok(Ok((data, _from))) => {
+                        // 受信データが "msg-" プレフィックスを持つことを確認
+                        let s = String::from_utf8_lossy(data);
+                        assert!(
+                            s.starts_with("msg-"),
+                            "received data must start with 'msg-', got: {}",
+                            s
+                        );
+                        received_count += 1;
+                    }
+                    Ok(Err(_)) => {
+                        // recv_from エラーは許容（安全性の問題ではない）
+                    }
+                    Err(_) => {
+                        // タイムアウトは許容（全メッセージが均等に分配されるとは限らない）
+                    }
+                }
+            }
+            // 少なくとも1つのタスクがメッセージを受信していること
+            assert!(
+                received_count > 0,
+                "n_tasks={}: at least one task must receive a message, got 0",
+                n_tasks
+            );
         }
     }
 }

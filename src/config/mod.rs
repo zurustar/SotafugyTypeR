@@ -254,6 +254,9 @@ pub struct ProxyServerConfig {
     pub auth_realm: String,
     pub users_file: Option<String>,
     pub debug: bool,
+    pub recv_task_count: usize,
+    #[serde(default = "default_bind_count")]
+    pub bind_count: usize,
 }
 
 impl Default for ProxyServerConfig {
@@ -267,8 +270,14 @@ impl Default for ProxyServerConfig {
             auth_realm: "sip-proxy".to_string(),
             users_file: None,
             debug: false,
+            recv_task_count: 4,
+            bind_count: 4,
         }
     }
+}
+
+fn default_bind_count() -> usize {
+    4
 }
 
 impl ProxyServerConfig {
@@ -281,6 +290,12 @@ impl ProxyServerConfig {
         }
         if self.forward_port == 0 {
             errors.push("forward_port must be greater than 0".to_string());
+        }
+        if self.recv_task_count == 0 {
+            errors.push("recv_task_count must be greater than 0".to_string());
+        }
+        if self.bind_count == 0 {
+            errors.push("bind_count must be greater than 0".to_string());
         }
         if self.auth_enabled {
             if self.users_file.is_none() {
@@ -578,8 +593,24 @@ pub mod generators {
                 )
             },
         )
-        .prop_map(
+        .prop_flat_map(
             |(host, port, forward_host, forward_port, auth_enabled, auth_realm, users_file, debug)| {
+                (
+                    Just(host),
+                    Just(port),
+                    Just(forward_host),
+                    Just(forward_port),
+                    Just(auth_enabled),
+                    Just(auth_realm),
+                    Just(users_file),
+                    Just(debug),
+                    1usize..=64, // recv_task_count
+                    1usize..=64, // bind_count
+                )
+            },
+        )
+        .prop_map(
+            |(host, port, forward_host, forward_port, auth_enabled, auth_realm, users_file, debug, recv_task_count, bind_count)| {
                 ProxyServerConfig {
                     host,
                     port,
@@ -589,6 +620,8 @@ pub mod generators {
                     auth_realm,
                     users_file,
                     debug,
+                    recv_task_count,
+                    bind_count,
                 }
             },
         )
@@ -1616,17 +1649,65 @@ mod tests {
             auth_realm: "test-realm".to_string(),
             users_file: Some("users.json".to_string()),
             debug: false,
+            recv_task_count: 4,
+            bind_count: 4,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ProxyServerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, deserialized);
     }
 
+    #[test]
+    fn test_proxy_server_config_recv_task_count_default_is_4() {
+        let config = ProxyServerConfig::default();
+        assert_eq!(config.recv_task_count, 4);
+    }
+
+    #[test]
+    fn test_proxy_server_config_recv_task_count_missing_defaults_to_4() {
+        let json = r#"{"host": "0.0.0.0", "port": 5060}"#;
+        let config: ProxyServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.recv_task_count, 4);
+    }
+
+    #[test]
+    fn test_proxy_server_config_recv_task_count_empty_object_defaults_to_4() {
+        let config: ProxyServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.recv_task_count, 4);
+    }
+
+    #[test]
+    fn test_proxy_server_config_validate_recv_task_count_zero() {
+        let mut config = ProxyServerConfig::default();
+        config.recv_task_count = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("recv_task_count")));
+    }
+
+    #[test]
+    fn test_proxy_server_config_recv_task_count_positive_value() {
+        let json = r#"{"recv_task_count": 8}"#;
+        let config: ProxyServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.recv_task_count, 8);
+    }
+
+    #[test]
+    fn test_proxy_server_config_recv_task_count_one_is_valid() {
+        let mut config = ProxyServerConfig::default();
+        config.recv_task_count = 1;
+        assert!(config.validate().is_ok());
+    }
+
+
     // ===== Property 1: ProxyServerConfig のラウンドトリップ =====
     // Feature: proxy-process-separation, Property 1: ProxyServerConfig のラウンドトリップ
     // **Validates: Requirements 2.3, 2.4, 2.5**
     // Feature: proxy-debug-logging, Property 6: ProxyServerConfig のラウンドトリップ
     // **Validates: Requirements 9.1**
+    // Feature: proxy-parallel-recv, Property 3: ProxyServerConfig の recv_task_count ラウンドトリップ
+    // **Validates: Requirements 2.1, 2.4**
+    // Feature: proxy-multi-socket-rport, Property 2: ProxyServerConfig の serde ラウンドトリップ
+    // **Validates: Requirements 2.4**
 
     proptest! {
         #[test]
@@ -1719,6 +1800,35 @@ mod tests {
         assert_eq!(loaded.transaction_t2_ms, None);
         assert_eq!(loaded.transaction_t4_ms, None);
         assert_eq!(loaded.max_transactions, Some(5000));
+    }
+
+    // ===== bind_count フィールドのテスト =====
+
+    #[test]
+    fn test_proxy_server_config_bind_count_default_is_4() {
+        let config = ProxyServerConfig::default();
+        assert_eq!(config.bind_count, 4);
+    }
+
+    #[test]
+    fn test_proxy_server_config_bind_count_empty_object_defaults_to_4() {
+        let config = load_proxy_config_from_str("{}").unwrap();
+        assert_eq!(config.bind_count, 4);
+    }
+
+    #[test]
+    fn test_proxy_server_config_validate_bind_count_zero() {
+        let mut config = ProxyServerConfig::default();
+        config.bind_count = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("bind_count must be greater than 0")));
+    }
+
+    #[test]
+    fn test_proxy_server_config_bind_count_positive_value() {
+        let json = r#"{"bind_count": 8}"#;
+        let config: ProxyServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.bind_count, 8);
     }
 
     // ===== Property 3: 後方互換性 - builtin_proxy の無視 =====

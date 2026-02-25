@@ -70,7 +70,7 @@ cat > "$BENCH_CFG" << 'EOF'
   "max_dialogs": 5000,
   "duration": 30,
   "scenario": "invite_bye",
-  "call_duration": 5,
+  "call_duration": 30,
   "shutdown_timeout": 3,
   "auth_enabled": true,
   "users_file": "/tmp/bench_users.json",

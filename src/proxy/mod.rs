@@ -233,11 +233,12 @@ impl SipProxy {
 
     /// Build a Via header value using push_str/write! to minimize format! usage.
     fn build_via_value(&self) -> String {
-        let mut via = String::with_capacity(80);
+        let mut via = String::with_capacity(90);
         via.push_str("SIP/2.0/UDP ");
         via.push_str(&self.config.host);
         via.push(':');
         let _ = write!(via, "{}", self.config.port);
+        via.push_str(";rport");
         via.push_str(";branch=z9hG4bK-proxy-");
         via.push_str(&rand_branch());
         via
@@ -515,9 +516,26 @@ fn parse_via_addr(via: &str) -> Option<SocketAddr> {
     let via = via.trim();
     // Skip "SIP/2.0/UDP " prefix
     let after_proto = via.split_whitespace().nth(1)?;
-    // Strip parameters
+    // Strip parameters to get base host:port
     let host_port = after_proto.split(';').next()?;
-    host_port.parse().ok()
+    let base_addr: SocketAddr = host_port.parse().ok()?;
+
+    // Extract received and rport parameters
+    let mut received_ip: Option<std::net::IpAddr> = None;
+    let mut rport_val: Option<u16> = None;
+
+    for param in after_proto.split(';').skip(1) {
+        let param = param.trim();
+        if let Some(val) = param.strip_prefix("received=") {
+            received_ip = val.parse().ok();
+        } else if let Some(val) = param.strip_prefix("rport=") {
+            rport_val = val.parse().ok();
+        }
+    }
+
+    let ip = received_ip.unwrap_or(base_addr.ip());
+    let port = rport_val.unwrap_or(base_addr.port());
+    Some(SocketAddr::new(ip, port))
 }
 
 /// Generate a random branch suffix for Via headers.
@@ -1245,6 +1263,56 @@ mod tests {
     #[test]
     fn test_parse_via_addr_invalid() {
         assert!(parse_via_addr("invalid").is_none());
+    }
+
+    // ===== parse_via_addr received/rport tests =====
+
+    #[test]
+    fn test_parse_via_addr_received_only() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;received=192.168.1.1;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("192.168.1.1:5060".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_via_addr_rport_with_value() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;rport=5062;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("10.0.0.1:5062".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_via_addr_received_and_rport() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;received=192.168.1.1;rport=5062;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("192.168.1.1:5062".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_via_addr_rport_without_value() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;rport;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("10.0.0.1:5060".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_via_addr_no_received_no_rport() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("10.0.0.1:5060".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_via_addr_rport_and_received_reversed_order() {
+        let addr = parse_via_addr(
+            "SIP/2.0/UDP 10.0.0.1:5060;rport=5062;received=192.168.1.1;branch=z9hG4bK776",
+        );
+        assert_eq!(addr, Some("192.168.1.1:5062".parse().unwrap()));
     }
 
     // ===== is_local_domain tests =====
@@ -2501,6 +2569,39 @@ mod tests {
         assert_eq!(vias.len(), 1, "Proxy Via should be removed, leaving 1 Via");
     }
 
+    // ===== Task 4.1: build_via_value の rport テスト =====
+
+    #[test]
+    fn test_build_via_value_contains_rport() {
+        // build_via_value が生成する Via ヘッダに ";rport" が含まれることを検証
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy(transport);
+        let via = proxy.build_via_value();
+        assert!(
+            via.contains(";rport"),
+            "Via header should contain ';rport', got: '{}'",
+            via
+        );
+    }
+
+    #[test]
+    fn test_build_via_value_has_rport_prefix_format() {
+        // Via ヘッダが "SIP/2.0/UDP {host}:{port};rport;branch=z9hG4bK-proxy-" のプレフィックスを持つことを検証
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy(transport);
+        let via = proxy.build_via_value();
+        let expected_prefix = format!(
+            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK-proxy-",
+            proxy.config.host, proxy.config.port
+        );
+        assert!(
+            via.starts_with(&expected_prefix),
+            "Via header should start with '{}', got: '{}'",
+            expected_prefix,
+            via
+        );
+    }
+
     #[tokio::test]
     async fn test_via_header_format_is_correct_after_optimization() {
         // Via ヘッダの形式が "SIP/2.0/UDP host:port;branch=z9hG4bK-proxy-XXXXXXXXXXXXXXXX" であるべき
@@ -2527,9 +2628,9 @@ mod tests {
         let (req, _) = &sent[0];
         let top_via = req.headers.get_all("Via")[0];
 
-        // Via の形式を検証
+        // Via の形式を検証（rport パラメータが含まれる）
         assert!(
-            top_via.starts_with("SIP/2.0/UDP 10.0.0.100:5060;branch=z9hG4bK-proxy-"),
+            top_via.starts_with("SIP/2.0/UDP 10.0.0.100:5060;rport;branch=z9hG4bK-proxy-"),
             "Via should have correct format, got: '{}'",
             top_via
         );
@@ -3645,6 +3746,278 @@ mod tests {
 
                 Ok(())
             })?;
+        }
+    }
+
+    // ===== Property 5: 並行 REGISTER 処理における LocationService の整合性 =====
+    // Feature: proxy-parallel-recv, Property 5: 並行 REGISTER 処理における LocationService の整合性
+    // **Validates: Requirements 4.5**
+
+    /// Strategy for generating a (AOR, ContactInfo) pair.
+    fn arb_aor_contact() -> impl Strategy<Value = (String, String, SocketAddr)> {
+        (arb_aor(), arb_contact_uri(), arb_socket_addr())
+    }
+
+    proptest! {
+        /// Feature: proxy-parallel-recv, Property 5: 並行 REGISTER 処理における LocationService の整合性
+        /// 複数タスクから同時に register を呼び出した後、各 AOR の lookup が有効な値を返す
+        /// **Validates: Requirements 4.5**
+        #[test]
+        fn prop_concurrent_register_location_service_integrity(
+            entries in proptest::collection::vec(arb_aor_contact(), 2..=16),
+            num_tasks in 2usize..=8,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let ls = Arc::new(LocationService::new());
+
+                // Spawn num_tasks concurrent tasks, each registering all entries
+                let mut handles = Vec::new();
+                for _ in 0..num_tasks {
+                    let ls_clone = ls.clone();
+                    let entries_clone = entries.clone();
+                    handles.push(tokio::spawn(async move {
+                        for (aor, contact_uri, address) in &entries_clone {
+                            let contact = ContactInfo {
+                                contact_uri: contact_uri.clone(),
+                                address: *address,
+                                expires: Instant::now() + std::time::Duration::from_secs(3600),
+                            };
+                            ls_clone.register(aor, contact);
+                        }
+                    }));
+                }
+
+                // Wait for all tasks to complete
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+
+                // Verify: every AOR has a valid ContactInfo after concurrent registration
+                for (aor, contact_uri, address) in &entries {
+                    let result = ls.lookup(aor);
+                    prop_assert!(
+                        result.is_some(),
+                        "AOR '{}' should be registered after concurrent writes",
+                        aor
+                    );
+                    let info = result.unwrap();
+                    // Since all tasks register the same data for each AOR,
+                    // the final value must match the original entry.
+                    prop_assert_eq!(
+                        &info.contact_uri, contact_uri,
+                        "contact_uri mismatch for AOR '{}'", aor
+                    );
+                    prop_assert_eq!(
+                        info.address, *address,
+                        "address mismatch for AOR '{}'", aor
+                    );
+                }
+
+                Ok(())
+            })?;
+        }
+    }
+
+    // ===== Property 4: parse_via_addr が received/rport パラメータを正しく解決する =====
+    // Feature: proxy-multi-socket-rport, Property 4: parse_via_addr が received/rport パラメータを正しく解決する
+    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4, 6.1, 6.2**
+
+    fn arb_ipv4() -> impl Strategy<Value = std::net::Ipv4Addr> {
+        (1u8..=254, 1u8..=254, 1u8..=254, 1u8..=254)
+            .prop_map(|(a, b, c, d)| std::net::Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn arb_port() -> impl Strategy<Value = u16> {
+        1024u16..60000
+    }
+
+    proptest! {
+        /// Feature: proxy-multi-socket-rport, Property 4: parse_via_addr が received/rport パラメータを正しく解決する
+        /// 任意の有効な IP アドレス、ポート、オプショナルな received IP、オプショナルな rport 値から
+        /// Via ヘッダ文字列を構成し、parse_via_addr の結果が期待通りであることを検証する
+        /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4, 6.1, 6.2**
+        #[test]
+        fn prop_parse_via_addr_received_rport_resolution(
+            base_ip in arb_ipv4(),
+            base_port in arb_port(),
+            received_ip in proptest::option::of(arb_ipv4()),
+            rport_val in proptest::option::of(arb_port()),
+            branch in "[a-zA-Z0-9]{4,12}",
+        ) {
+            // Build Via header with optional received and rport parameters
+            let mut via = format!("SIP/2.0/UDP {}:{}", base_ip, base_port);
+            if let Some(recv) = received_ip {
+                via.push_str(&format!(";received={}", recv));
+            }
+            if let Some(rp) = rport_val {
+                via.push_str(&format!(";rport={}", rp));
+            }
+            via.push_str(&format!(";branch=z9hG4bK{}", branch));
+
+            let result = parse_via_addr(&via);
+            prop_assert!(result.is_some(), "parse_via_addr should return Some for valid Via: {}", via);
+
+            let addr = result.unwrap();
+
+            // IP: received が存在すれば received の値、なければ base_ip
+            let expected_ip: std::net::IpAddr = if let Some(recv) = received_ip {
+                recv.into()
+            } else {
+                base_ip.into()
+            };
+            prop_assert_eq!(addr.ip(), expected_ip, "IP mismatch for Via: {}", via);
+
+            // Port: rport=<値> が存在すれば rport の値、なければ base_port
+            let expected_port = rport_val.unwrap_or(base_port);
+            prop_assert_eq!(addr.port(), expected_port, "Port mismatch for Via: {}", via);
+        }
+    }
+
+    // ===== Property 5: parse_via_addr はパラメータの順序に依存しない =====
+    // Feature: proxy-multi-socket-rport, Property 5: parse_via_addr はパラメータの順序に依存しない
+    // **Validates: Requirements 6.4**
+
+    proptest! {
+        /// Feature: proxy-multi-socket-rport, Property 5: parse_via_addr はパラメータの順序に依存しない
+        /// パラメータの順序を入れ替えた Via ヘッダ文字列を生成し、順序に関わらず同じ SocketAddr が返されることを検証する
+        /// **Validates: Requirements 6.4**
+        #[test]
+        fn prop_parse_via_addr_parameter_order_independent(
+            base_ip in arb_ipv4(),
+            base_port in arb_port(),
+            received_ip in proptest::option::of(arb_ipv4()),
+            rport_val in proptest::option::of(arb_port()),
+            branch in "[a-zA-Z0-9]{4,12}",
+        ) {
+            // Build parameter list
+            let mut params: Vec<String> = Vec::new();
+            if let Some(recv) = received_ip {
+                params.push(format!("received={}", recv));
+            }
+            if let Some(rp) = rport_val {
+                params.push(format!("rport={}", rp));
+            }
+            params.push(format!("branch=z9hG4bK{}", branch));
+
+            // Order A: original order
+            let via_a = format!("SIP/2.0/UDP {}:{};{}", base_ip, base_port, params.join(";"));
+
+            // Order B: reversed parameter order
+            let mut reversed = params.clone();
+            reversed.reverse();
+            let via_b = format!("SIP/2.0/UDP {}:{};{}", base_ip, base_port, reversed.join(";"));
+
+            let result_a = parse_via_addr(&via_a);
+            let result_b = parse_via_addr(&via_b);
+
+            prop_assert!(result_a.is_some(), "parse_via_addr should return Some for: {}", via_a);
+            prop_assert!(result_b.is_some(), "parse_via_addr should return Some for: {}", via_b);
+            prop_assert_eq!(
+                result_a.unwrap(),
+                result_b.unwrap(),
+                "Parameter order should not affect result.\n  Via A: {}\n  Via B: {}",
+                via_a,
+                via_b
+            );
+        }
+    }
+
+    // ===== Property 6: Via ヘッダのパース・ラウンドトリップ =====
+    // Feature: proxy-multi-socket-rport, Property 6: Via ヘッダのパース・ラウンドトリップ
+    // **Validates: Requirements 6.5**
+
+    proptest! {
+        /// Feature: proxy-multi-socket-rport, Property 6: Via ヘッダのパース・ラウンドトリップ
+        /// 有効な Via ヘッダ文字列を生成し、parse_via_addr でパースした SocketAddr を使って
+        /// Via ヘッダを再構成し、再度パースした結果が一致することを検証する
+        /// **Validates: Requirements 6.5**
+        #[test]
+        fn prop_parse_via_addr_roundtrip(
+            base_ip in arb_ipv4(),
+            base_port in arb_port(),
+            received_ip in proptest::option::of(arb_ipv4()),
+            rport_val in proptest::option::of(arb_port()),
+            branch in "[a-zA-Z0-9]{4,12}",
+        ) {
+            // Step 1: Build a Via header with optional received/rport parameters
+            let mut via = format!("SIP/2.0/UDP {}:{}", base_ip, base_port);
+            if let Some(recv) = received_ip {
+                via.push_str(&format!(";received={}", recv));
+            }
+            if let Some(rp) = rport_val {
+                via.push_str(&format!(";rport={}", rp));
+            }
+            via.push_str(&format!(";branch=z9hG4bK{}", branch));
+
+            // Step 2: Parse the Via header to get a SocketAddr
+            let first_parse = parse_via_addr(&via);
+            prop_assert!(first_parse.is_some(), "First parse should succeed for: {}", via);
+            let addr = first_parse.unwrap();
+
+            // Step 3: Reconstruct a Via header from the parsed SocketAddr
+            let reconstructed = format!(
+                "SIP/2.0/UDP {};branch=z9hG4bK{}",
+                addr, branch
+            );
+
+            // Step 4: Parse the reconstructed Via header
+            let second_parse = parse_via_addr(&reconstructed);
+            prop_assert!(second_parse.is_some(), "Second parse should succeed for: {}", reconstructed);
+
+            // Step 5: Verify roundtrip - both parses yield the same SocketAddr
+            prop_assert_eq!(
+                addr,
+                second_parse.unwrap(),
+                "Roundtrip failed.\n  Original Via: {}\n  First parse: {}\n  Reconstructed Via: {}",
+                via,
+                addr,
+                reconstructed
+            );
+        }
+    }
+
+    // ===== Property 3: Via ヘッダに rport パラメータが含まれる =====
+    // Feature: proxy-multi-socket-rport, Property 3: Via ヘッダに rport パラメータが含まれる
+    // **Validates: Requirements 4.1, 4.2**
+
+    fn arb_host() -> impl Strategy<Value = String> {
+        arb_ipv4().prop_map(|ip| ip.to_string())
+    }
+
+    proptest! {
+        /// Feature: proxy-multi-socket-rport, Property 3: Via ヘッダに rport パラメータが含まれる
+        /// 任意の host, port から ProxyConfig を構成し、build_via_value が
+        /// "SIP/2.0/UDP {host}:{port};rport;branch=z9hG4bK-proxy-" のプレフィックスを持つことを検証する
+        /// **Validates: Requirements 4.1, 4.2**
+        #[test]
+        fn prop_build_via_value_contains_rport_prefix(
+            host in arb_host(),
+            port in arb_port(),
+        ) {
+            let config = ProxyConfig {
+                host: host.clone(),
+                port,
+                forward_addr: uas_addr(),
+                domain: host.clone(),
+                debug: false,
+            };
+            let transport = Arc::new(MockTransport::new());
+            let location_service = Arc::new(LocationService::new());
+            let proxy = SipProxy::new(transport, location_service, None, config);
+
+            let via = proxy.build_via_value();
+
+            let expected_prefix = format!(
+                "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK-proxy-",
+                host, port
+            );
+            prop_assert!(
+                via.starts_with(&expected_prefix),
+                "Via header should start with '{}', got: '{}'",
+                expected_prefix,
+                via
+            );
         }
     }
 }

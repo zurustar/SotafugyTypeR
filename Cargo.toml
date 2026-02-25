@@ -25,6 +25,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 itoa = "1"
+futures = "0.3"
 
 [dev-dependencies]
 proptest = "1"
