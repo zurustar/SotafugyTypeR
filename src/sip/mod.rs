@@ -1,6 +1,7 @@
 pub mod parser;
 pub mod formatter;
 pub mod message;
+pub mod pool;
 
 use std::hash::{Hash, Hasher};
 #[allow(deprecated)]

@@ -6,7 +6,6 @@
   "uas_host": "127.0.0.1",
   "uas_port": 5080,
   "target_cps": 100.0,
-  "max_dialogs": 50000,
   "duration": 30,
   "scenario": "invite_bye",
   "call_duration": 5,

@@ -5,6 +5,7 @@ use sip_load_test::config::load_proxy_config_from_file;
 use sip_load_test::proxy::{LocationService, ProxyConfig, SipProxy};
 use sip_load_test::sip::message::SipMessage;
 use sip_load_test::sip::parser::parse_sip_message;
+use sip_load_test::sip::pool::MessagePool;
 use sip_load_test::transport::UdpTransport;
 use sip_load_test::user_pool::UserPool;
 use std::net::IpAddr;
@@ -60,22 +61,19 @@ async fn recv_loop(
             }
         };
 
-        // リクエスト/レスポンスの振り分け（並行処理）
-        let proxy = proxy.clone();
-        tokio::spawn(async move {
-            match &msg {
-                SipMessage::Request(_) => {
-                    if let Err(e) = proxy.handle_request(msg, from).await {
-                        eprintln!("Error handling request from {}: {}", from, e);
-                    }
-                }
-                SipMessage::Response(_) => {
-                    if let Err(e) = proxy.handle_response(msg, from).await {
-                        eprintln!("Error handling response from {}: {}", from, e);
-                    }
+        // リクエスト/レスポンスの振り分け（インライン処理）
+        match &msg {
+            SipMessage::Request(_) => {
+                if let Err(e) = proxy.handle_request(msg, from).await {
+                    eprintln!("Error handling request from {}: {}", from, e);
                 }
             }
-        });
+            SipMessage::Response(_) => {
+                if let Err(e) = proxy.handle_response(msg, from).await {
+                    eprintln!("Error handling response from {}: {}", from, e);
+                }
+            }
+        }
     }
 }
 
@@ -171,7 +169,8 @@ async fn main() {
     };
 
     // SipProxy インスタンスの生成（Arc で共有し、spawn した非同期タスクで並行処理）
-    let proxy = Arc::new(SipProxy::new(transport_arc, location_service, auth, proxy_config));
+    let pool = Arc::new(MessagePool::new(config.bind_count * 2));
+    let proxy = Arc::new(SipProxy::new(transport_arc, location_service, auth, proxy_config, pool));
 
     // シャットダウンフラグの設定
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -254,6 +253,7 @@ mod tests {
     }
 
     use sip_load_test::proxy::LocationService;
+    use sip_load_test::sip::pool::MessagePool;
     use sip_load_test::uas::SipTransport;
     use std::net::SocketAddr;
 
@@ -292,7 +292,7 @@ mod tests {
             domain: "127.0.0.1".to_string(),
             debug: false,
         };
-        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config));
+        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config, Arc::new(MessagePool::new(4))));
 
         // シャットダウンフラグを true に設定
         let shutdown = Arc::new(AtomicBool::new(true));
@@ -342,7 +342,7 @@ mod tests {
                     domain: "127.0.0.1".to_string(),
                     debug: false,
                 };
-                let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config));
+                let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config, Arc::new(MessagePool::new(4))));
 
                 // シャットダウンフラグを true に設定（タスクが即座に終了するように）
                 let shutdown = Arc::new(AtomicBool::new(true));
@@ -403,7 +403,7 @@ mod tests {
                     domain: "127.0.0.1".to_string(),
                     debug: false,
                 };
-                let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config));
+                let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config, Arc::new(MessagePool::new(4))));
 
                 // シャットダウンフラグを false で起動（タスクが実際にループに入る）
                 let shutdown = Arc::new(AtomicBool::new(false));
@@ -474,7 +474,7 @@ mod tests {
             domain: "127.0.0.1".to_string(),
             debug: false,
         };
-        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config));
+        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config, Arc::new(MessagePool::new(4))));
 
         let shutdown = Arc::new(AtomicBool::new(true));
 
@@ -520,7 +520,7 @@ mod tests {
             domain: "127.0.0.1".to_string(),
             debug: false,
         };
-        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config));
+        let proxy = Arc::new(SipProxy::new(mock_transport, location_service, None, proxy_config, Arc::new(MessagePool::new(4))));
 
         // シャットダウンフラグを false で起動（タスクが実際にループに入る）
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -619,4 +619,216 @@ mod tests {
         assert_eq!(config.bind_count, 4, "bind_count should default to 4 when not specified in file");
         assert!(config.validate().is_ok(), "config loaded from proxy_config.json should pass validation");
     }
+
+    /// recv_loop のメッセージディスパッチブロックに tokio::spawn が使用されていないことを検証する。
+    /// ソースコードを読み取り、recv_loop 関数内のディスパッチ部分を検査する。
+    /// Requirements: 1.4, 4.1
+    #[test]
+    fn test_recv_loop_does_not_contain_tokio_spawn_for_dispatch() {
+        let source = std::fs::read_to_string("src/bin/sip_proxy.rs")
+            .expect("Failed to read src/bin/sip_proxy.rs");
+
+        // recv_loop 関数の本体を抽出する
+        let fn_start = source.find("async fn recv_loop(")
+            .expect("recv_loop function not found in source");
+
+        // 関数本体の開始位置（最初の '{' ）を見つける
+        let body_start = source[fn_start..].find('{')
+            .expect("recv_loop function body not found") + fn_start;
+
+        // ブレース対応で関数本体の終了位置を見つける
+        let mut depth = 0;
+        let mut body_end = body_start;
+        for (i, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let recv_loop_body = &source[body_start..=body_end];
+
+        // メッセージディスパッチブロック内に tokio::spawn が含まれていないことを検証
+        assert!(
+            !recv_loop_body.contains("tokio::spawn"),
+            "recv_loop should not use tokio::spawn for message dispatch. \
+             Found tokio::spawn in recv_loop body:\n{}",
+            recv_loop_body
+        );
+    }
+
+    /// エラーを返すモックトランスポート（Property 1 テスト用）
+    /// send_to が常にエラーを返すため、handle_request / handle_response がエラーを返す
+    struct FailingMockTransport {
+        error_msg: String,
+    }
+
+    impl FailingMockTransport {
+        fn new(error_msg: String) -> Self {
+            Self { error_msg }
+        }
+    }
+
+    impl SipTransport for FailingMockTransport {
+        fn send_to<'a>(
+            &'a self,
+            _data: &'a [u8],
+            _addr: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), sip_load_test::error::SipLoadTestError>> + Send + 'a>,
+        > {
+            let msg = self.error_msg.clone();
+            Box::pin(async move {
+                Err(sip_load_test::error::SipLoadTestError::NetworkError(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, msg),
+                ))
+            })
+        }
+    }
+
+    /// SIPリクエストのバイト列を生成するヘルパー
+    fn build_sip_request_bytes(call_id: &str) -> Vec<u8> {
+        use sip_load_test::sip::message::{Headers, SipRequest, Method};
+        use sip_load_test::sip::formatter::format_sip_message;
+
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string());
+        headers.add("From", "<sip:alice@10.0.0.1>;tag=1234".to_string());
+        headers.add("To", "<sip:bob@10.0.0.2>".to_string());
+        headers.add("Call-ID", call_id.to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+        headers.add("Content-Length", "0".to_string());
+
+        let msg = SipMessage::Request(SipRequest {
+            method: Method::Invite,
+            request_uri: "sip:bob@10.0.0.2:5080".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: None,
+        });
+        format_sip_message(&msg)
+    }
+
+    /// SIPレスポンスのバイト列を生成するヘルパー
+    fn build_sip_response_bytes(call_id: &str) -> Vec<u8> {
+        use sip_load_test::sip::message::{Headers, SipResponse};
+        use sip_load_test::sip::formatter::format_sip_message;
+
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-test".to_string());
+        headers.add("From", "<sip:alice@10.0.0.1>;tag=1234".to_string());
+        headers.add("To", "<sip:bob@10.0.0.2>;tag=5678".to_string());
+        headers.add("Call-ID", call_id.to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+        headers.add("Content-Length", "0".to_string());
+
+        let msg = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: None,
+        });
+        format_sip_message(&msg)
+    }
+
+    // Feature: proxy-spawn-reduction, Property 1: エラー耐性 — メッセージ処理エラーによるループ継続
+    // **Validates: Requirements 2.1, 2.2, 2.3**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_recv_loop_continues_after_handle_error(
+            // ランダム生成: メッセージ種別 (true=Request, false=Response)
+            is_request in proptest::bool::ANY,
+            // ランダム生成: エラーメッセージ（エラーの種類を表現）
+            error_suffix in "[a-z]{3,10}",
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                // recv_loop 用の UdpTransport をバインド
+                let transport = Arc::new(
+                    UdpTransport::bind("127.0.0.1".parse().unwrap(), 0, 1)
+                        .await
+                        .unwrap(),
+                );
+                let recv_addr = transport.local_addr(0).unwrap();
+
+                // エラーを返す FailingMockTransport で SipProxy を構築
+                let error_msg = format!("test_error_{}", error_suffix);
+                let failing_transport: Arc<dyn SipTransport> =
+                    Arc::new(FailingMockTransport::new(error_msg));
+                let location_service = Arc::new(LocationService::new());
+                let proxy_config = ProxyConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: recv_addr.port(),
+                    forward_addr: "127.0.0.1:5080".parse().unwrap(),
+                    domain: "127.0.0.1".to_string(),
+                    debug: false,
+                };
+                let proxy = Arc::new(SipProxy::new(
+                    failing_transport,
+                    location_service,
+                    None,
+                    proxy_config,
+                    Arc::new(MessagePool::new(2)),
+                ));
+
+                let shutdown = Arc::new(AtomicBool::new(false));
+
+                // recv_loop を起動
+                let t = transport.clone();
+                let p = proxy.clone();
+                let s = shutdown.clone();
+                let handle = tokio::spawn(recv_loop(t, p, s, 0));
+
+                // テスト用 UDP ソケットからメッセージを送信
+                let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+                // エラーを引き起こすメッセージを送信（handle_request/handle_response が Err を返す）
+                let call_id = format!("error-test-{}", error_suffix);
+                let msg_bytes = if is_request {
+                    build_sip_request_bytes(&call_id)
+                } else {
+                    build_sip_response_bytes(&call_id)
+                };
+                sender.send_to(&msg_bytes, recv_addr).await.unwrap();
+
+                // recv_loop がエラーを処理して継続する時間を確保
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                // シャットダウンフラグを設定
+                shutdown.store(true, Ordering::SeqCst);
+
+                // recv_loop がタイムアウト内に正常終了することを検証
+                // （エラーで停止していたらタイムアウトする）
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    handle,
+                )
+                .await;
+
+                prop_assert!(
+                    result.is_ok(),
+                    "recv_loop should terminate within timeout after shutdown (not stuck on error)"
+                );
+                let join_result = result.unwrap();
+                prop_assert!(
+                    join_result.is_ok(),
+                    "recv_loop should not panic after handle error"
+                );
+
+                Ok(())
+            })?;
+        }
+    }
+
+
 }

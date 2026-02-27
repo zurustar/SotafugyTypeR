@@ -80,7 +80,8 @@ pub struct Config {
     pub uas_host: String,
     pub uas_port: u16,
     pub target_cps: f64,
-    pub max_dialogs: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_dialogs: Option<usize>,
     pub duration: u64,
     pub scenario: Scenario,
     pub pattern: PatternConfig,
@@ -114,7 +115,7 @@ impl Default for Config {
             uas_host: "127.0.0.1".to_string(),
             uas_port: 5080,
             target_cps: 10.0,
-            max_dialogs: 10_000,
+            max_dialogs: None,
             duration: 60,
             scenario: Scenario::default(),
             pattern: PatternConfig::default(),
@@ -148,7 +149,7 @@ impl Config {
         if self.target_cps <= 0.0 {
             errors.push("target_cps must be greater than 0".to_string());
         }
-        if self.max_dialogs == 0 {
+        if let Some(0) = self.max_dialogs {
             errors.push("max_dialogs must be greater than 0".to_string());
         }
         if self.duration == 0 {
@@ -214,6 +215,77 @@ impl Config {
         } else {
             Err(errors)
         }
+    }
+}
+
+/// Config から margin_factor を計算する。
+/// session_expires / 2 < call_duration の場合は 1.3（re-INVITE オーバーラップ考慮）、
+/// それ以外は 1.2 を返す。
+fn compute_margin_factor(config: &Config) -> f64 {
+    let base = 1.2;
+    if config.session_expires > 0 && (config.session_expires / 2) < config.call_duration {
+        base + 0.1
+    } else {
+        base
+    }
+}
+/// max_dialogs 自動計算の内訳。ログ出力用。
+#[derive(Debug, Clone)]
+pub struct MaxDialogsBreakdown {
+    pub effective_cps: f64,
+    pub call_duration: u64,
+    pub margin_factor: f64,
+    pub result: usize,
+}
+
+/// Config から必要な max_dialogs を自動計算する。
+/// 計算式: ceil(effective_cps × call_duration × margin_factor)
+/// 最小値は 1 を保証する。
+pub fn calculate_max_dialogs(config: &Config) -> usize {
+    calculate_max_dialogs_breakdown(config).result
+}
+
+/// Config から必要な max_dialogs を自動計算し、計算内訳を返す。
+/// ログ出力で effective_cps, call_duration, margin_factor, result を表示するために使用する。
+pub fn calculate_max_dialogs_breakdown(config: &Config) -> MaxDialogsBreakdown {
+    let effective_cps = compute_effective_cps(config);
+    let margin_factor = compute_margin_factor(config);
+    let raw = effective_cps * config.call_duration as f64 * margin_factor;
+    let result = raw.ceil().max(1.0) as usize;
+    MaxDialogsBreakdown {
+        effective_cps,
+        call_duration: config.call_duration,
+        margin_factor,
+        result,
+    }
+}
+
+
+/// Config から実行モードに応じた effective_cps を計算する。
+/// - Sustained: target_cps
+/// - StepUp: step_up.max_cps（設定なしなら target_cps）
+/// - BinarySearch: initial_cps × 2^N（target_cps を超える最小値、上限 target_cps × 2）。
+///   設定なしなら target_cps
+fn compute_effective_cps(config: &Config) -> f64 {
+    match config.mode {
+        RunMode::Sustained => config.target_cps,
+        RunMode::StepUp => config
+            .step_up
+            .as_ref()
+            .map(|su| su.max_cps)
+            .unwrap_or(config.target_cps),
+        RunMode::BinarySearch => config
+            .binary_search
+            .as_ref()
+            .map(|bs| {
+                let cap = config.target_cps * 2.0;
+                let mut cps = bs.initial_cps;
+                while cps <= config.target_cps {
+                    cps *= 2.0;
+                }
+                cps.min(cap)
+            })
+            .unwrap_or(config.target_cps),
     }
 }
 
@@ -437,7 +509,7 @@ pub mod generators {
         // Group 2: core settings (5 fields)
         let core = (
             0.1f64..1000.0,  // target_cps > 0
-            1usize..100000,  // max_dialogs > 0
+            proptest::option::of(1usize..100000),  // max_dialogs: Option<usize>
             1u64..3600,      // duration > 0
             arb_scenario(),
             arb_pattern_config(),
@@ -661,7 +733,7 @@ mod tests {
         // Other fields should be defaults
         assert_eq!(loaded.proxy_host, "127.0.0.1");
         assert_eq!(loaded.proxy_port, 5060);
-        assert_eq!(loaded.max_dialogs, 10_000);
+        assert_eq!(loaded.max_dialogs, None);
         assert_eq!(loaded.mode, RunMode::Sustained);
     }
 
@@ -806,7 +878,7 @@ mod tests {
         assert_eq!(config.uas_host, "127.0.0.1");
         assert_eq!(config.uas_port, 5080);
         assert_eq!(config.target_cps, 10.0);
-        assert_eq!(config.max_dialogs, 10_000);
+        assert_eq!(config.max_dialogs, None);
         assert_eq!(config.duration, 60);
         assert_eq!(config.scenario, Scenario::Register);
         assert_eq!(config.pattern, PatternConfig::Sustained { duration_secs: 60 });
@@ -860,9 +932,27 @@ mod tests {
     #[test]
     fn test_validate_max_dialogs_zero() {
         let mut config = Config::default();
-        config.max_dialogs = 0;
+        config.max_dialogs = Some(0);
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("max_dialogs")));
+    }
+
+    #[test]
+    fn test_validate_max_dialogs_none_skips_validation() {
+        // Requirements 6.2: None の場合はバリデーションをスキップ
+        let mut config = Config::default();
+        config.max_dialogs = None;
+        let result = config.validate();
+        assert!(result.is_ok(), "max_dialogs=None should pass validation");
+    }
+
+    #[test]
+    fn test_validate_max_dialogs_positive_value() {
+        // Requirements 6.3: 正の値はエラーなし
+        let mut config = Config::default();
+        config.max_dialogs = Some(100);
+        let result = config.validate();
+        assert!(result.is_ok(), "max_dialogs=Some(100) should pass validation");
     }
 
     #[test]
@@ -1025,7 +1115,7 @@ mod tests {
     fn test_validate_multiple_errors() {
         let mut config = Config::default();
         config.target_cps = 0.0;
-        config.max_dialogs = 0;
+        config.max_dialogs = Some(0);
         config.duration = 0;
         let errors = config.validate().unwrap_err();
         assert!(errors.len() >= 3);
@@ -1162,6 +1252,83 @@ mod tests {
         }
     }
 
+    // ===== Property 4: Config serde ラウンドトリップ (max_dialogs) =====
+    // Feature: auto-max-dialogs, Property 4: Config serde ラウンドトリップ
+    // `max_dialogs` が `None` または `Some(n)` のいずれでもシリアライズ→デシリアライズで値が保存されること
+    // **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+
+    proptest! {
+        /// max_dialogs が None の場合、シリアライズ→デシリアライズで None が保存されること
+        #[test]
+        fn prop_config_serde_roundtrip_max_dialogs_none(mut config in generators::arb_config()) {
+            config.max_dialogs = None;
+            let json = serde_json::to_string(&config).unwrap();
+            let deserialized: Config = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(deserialized.max_dialogs, None);
+            prop_assert_eq!(config, deserialized);
+        }
+
+        /// max_dialogs が Some(n) の場合、シリアライズ→デシリアライズで Some(n) が保存されること
+        #[test]
+        fn prop_config_serde_roundtrip_max_dialogs_some(
+            mut config in generators::arb_config(),
+            n in 1usize..100000
+        ) {
+            config.max_dialogs = Some(n);
+            let json = serde_json::to_string(&config).unwrap();
+            let deserialized: Config = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(deserialized.max_dialogs, Some(n));
+            prop_assert_eq!(config, deserialized);
+        }
+    }
+
+    // ===== Property 5: バリデーションの正当性 =====
+    // Feature: auto-max-dialogs, Property 5: バリデーションの正当性
+    // `max_dialogs` が `None` または `Some(n > 0)` の場合、バリデーションエラーが発生しないこと
+    // **Validates: Requirements 6.2, 6.3**
+
+    proptest! {
+        /// max_dialogs が None の場合、バリデーションは max_dialogs に関するエラーを返さないこと
+        #[test]
+        fn prop_validation_max_dialogs_none_no_error(mut config in generators::arb_config()) {
+            config.max_dialogs = None;
+            // validate() が Ok または max_dialogs 以外のエラーのみを返すことを検証
+            match config.validate() {
+                Ok(()) => { /* pass */ }
+                Err(errors) => {
+                    for err in &errors {
+                        prop_assert!(
+                            !err.contains("max_dialogs"),
+                            "max_dialogs が None のとき max_dialogs 関連のエラーが発生: {}",
+                            err
+                        );
+                    }
+                }
+            }
+        }
+
+        /// max_dialogs が Some(n > 0) の場合、バリデーションは max_dialogs に関するエラーを返さないこと
+        #[test]
+        fn prop_validation_max_dialogs_positive_no_error(
+            mut config in generators::arb_config(),
+            n in 1usize..100000
+        ) {
+            config.max_dialogs = Some(n);
+            match config.validate() {
+                Ok(()) => { /* pass */ }
+                Err(errors) => {
+                    for err in &errors {
+                        prop_assert!(
+                            !err.contains("max_dialogs"),
+                            "max_dialogs が Some({}) のとき max_dialogs 関連のエラーが発生: {}",
+                            n, err
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ===== Property 14: 不正設定値のエラー検出 =====
     // Feature: sip-load-tester, Property 14: 不正設定値のエラー検出
     // **Validates: Requirements 14.3**
@@ -1186,12 +1353,12 @@ mod tests {
             prop_assert!(config.validate().is_err());
         }
 
-        /// Strategy 2: Config with max_dialogs == 0 should fail validation
+        /// Strategy 2: Config with max_dialogs == Some(0) should fail validation
         #[test]
         fn prop_invalid_max_dialogs_fails_validation(
             mut config in generators::arb_config()
         ) {
-            config.max_dialogs = 0;
+            config.max_dialogs = Some(0);
             prop_assert!(config.validate().is_err());
         }
 
@@ -1831,6 +1998,121 @@ mod tests {
         assert_eq!(config.bind_count, 8);
     }
 
+    // ===== compute_margin_factor ユニットテスト =====
+    // Feature: auto-max-dialogs
+    // Requirements: 1.2, 1.3
+
+    #[test]
+    fn test_compute_margin_factor_default_is_1_2() {
+        // session_expires=300, call_duration=30 → 300/2=150 >= 30 → 1.2
+        let config = Config {
+            session_expires: 300,
+            call_duration: 30,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.2);
+    }
+
+    #[test]
+    fn test_compute_margin_factor_session_timer_overlap_is_1_3() {
+        // session_expires=40, call_duration=30 → 40/2=20 < 30 → 1.3
+        let config = Config {
+            session_expires: 40,
+            call_duration: 30,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.3);
+    }
+
+    #[test]
+    fn test_compute_margin_factor_boundary_equal() {
+        // session_expires=60, call_duration=30 → 60/2=30, 30 < 30 is false → 1.2
+        let config = Config {
+            session_expires: 60,
+            call_duration: 30,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.2);
+    }
+
+    #[test]
+    fn test_compute_margin_factor_boundary_just_below() {
+        // session_expires=58, call_duration=30 → 58/2=29 (integer division), 29 < 30 → 1.3
+        let config = Config {
+            session_expires: 58,
+            call_duration: 30,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.3);
+    }
+
+    #[test]
+    fn test_compute_margin_factor_session_expires_zero() {
+        // session_expires=0 → design says "if config.session_expires > 0 && ..."
+        // session_expires=0 → condition is false → 1.2
+        let config = Config {
+            session_expires: 0,
+            call_duration: 30,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.2);
+    }
+
+    #[test]
+    fn test_compute_margin_factor_call_duration_zero() {
+        // session_expires=300, call_duration=0 → 300/2=150, 150 < 0 is false → 1.2
+        let config = Config {
+            session_expires: 300,
+            call_duration: 0,
+            ..Config::default()
+        };
+        assert_eq!(compute_margin_factor(&config), 1.2);
+    }
+
+    // ===== Property 2: マージン係数の正当性 =====
+    // Feature: auto-max-dialogs, Property 2: マージン係数の正当性
+    // `session_expires / 2 < call_duration` の条件に応じて 1.2 または 1.3 が返ること
+    // **Validates: Requirements 1.2, 1.3**
+
+    proptest! {
+        /// session_expires > 0 かつ session_expires / 2 < call_duration の場合、
+        /// マージン係数は 1.3 であること
+        #[test]
+        fn prop_margin_factor_session_timer_overlap(
+            config in generators::arb_config()
+        ) {
+            let result = compute_margin_factor(&config);
+            if config.session_expires > 0
+                && (config.session_expires / 2) < config.call_duration
+            {
+                prop_assert!(
+                    (result - 1.3).abs() < f64::EPSILON,
+                    "session_expires={}, call_duration={} → expected 1.3, got {}",
+                    config.session_expires, config.call_duration, result
+                );
+            } else {
+                prop_assert!(
+                    (result - 1.2).abs() < f64::EPSILON,
+                    "session_expires={}, call_duration={} → expected 1.2, got {}",
+                    config.session_expires, config.call_duration, result
+                );
+            }
+        }
+
+        /// マージン係数は常に 1.2 または 1.3 のいずれかであること
+        #[test]
+        fn prop_margin_factor_is_1_2_or_1_3(
+            config in generators::arb_config()
+        ) {
+            let result = compute_margin_factor(&config);
+            prop_assert!(
+                (result - 1.2).abs() < f64::EPSILON || (result - 1.3).abs() < f64::EPSILON,
+                "margin_factor must be 1.2 or 1.3, got {}",
+                result
+            );
+        }
+    }
+
     // ===== Property 3: 後方互換性 - builtin_proxy の無視 =====
     // Feature: proxy-process-separation, Property 3: 後方互換性 - builtin_proxy の無視
     // **Validates: Requirements 4.3**
@@ -1883,4 +2165,608 @@ mod tests {
             prop_assert_eq!(parsed.mode, config.mode);
         }
     }
+
+    // ===== Property 3: モード別 effective_cps の正当性 =====
+    // Feature: auto-max-dialogs, Property 3: モード別 effective_cps の正当性
+    // 各モードで期待される effective_cps が返ること
+    // **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+
+    proptest! {
+        /// Sustained モードでは effective_cps == target_cps であること
+        #[test]
+        fn prop_effective_cps_sustained(mut config in generators::arb_config()) {
+            config.mode = RunMode::Sustained;
+            let result = compute_effective_cps(&config);
+            prop_assert!(
+                (result - config.target_cps).abs() < f64::EPSILON,
+                "Sustained: expected target_cps={}, got {}",
+                config.target_cps, result
+            );
+        }
+
+        /// StepUp モードで step_up 設定ありの場合、effective_cps == step_up.max_cps であること
+        #[test]
+        fn prop_effective_cps_step_up_with_config(
+            mut config in generators::arb_config(),
+            step_up in generators::arb_step_up_config()
+        ) {
+            config.mode = RunMode::StepUp;
+            config.step_up = Some(step_up.clone());
+            let result = compute_effective_cps(&config);
+            prop_assert!(
+                (result - step_up.max_cps).abs() < f64::EPSILON,
+                "StepUp with config: expected max_cps={}, got {}",
+                step_up.max_cps, result
+            );
+        }
+
+        /// StepUp モードで step_up 設定なしの場合、effective_cps == target_cps であること
+        #[test]
+        fn prop_effective_cps_step_up_without_config(mut config in generators::arb_config()) {
+            config.mode = RunMode::StepUp;
+            config.step_up = None;
+            let result = compute_effective_cps(&config);
+            prop_assert!(
+                (result - config.target_cps).abs() < f64::EPSILON,
+                "StepUp without config: expected target_cps={}, got {}",
+                config.target_cps, result
+            );
+        }
+
+        /// BinarySearch モードで binary_search 設定ありの場合、
+        /// effective_cps は initial_cps × 2^N（target_cps を超える最小の N）で、
+        /// 上限は target_cps × 2 であること
+        #[test]
+        fn prop_effective_cps_binary_search_with_config(
+            mut config in generators::arb_config(),
+            bs in generators::arb_binary_search_config()
+        ) {
+            config.mode = RunMode::BinarySearch;
+            config.binary_search = Some(bs.clone());
+
+            let result = compute_effective_cps(&config);
+
+            // 期待値を独立に計算
+            let cap = config.target_cps * 2.0;
+            let mut expected = bs.initial_cps;
+            while expected <= config.target_cps {
+                expected *= 2.0;
+            }
+            expected = expected.min(cap);
+
+            prop_assert!(
+                (result - expected).abs() < f64::EPSILON,
+                "BinarySearch: initial_cps={}, target_cps={}, expected={}, got {}",
+                bs.initial_cps, config.target_cps, expected, result
+            );
+        }
+
+        /// BinarySearch モードで binary_search 設定なしの場合、effective_cps == target_cps であること
+        #[test]
+        fn prop_effective_cps_binary_search_without_config(mut config in generators::arb_config()) {
+            config.mode = RunMode::BinarySearch;
+            config.binary_search = None;
+            let result = compute_effective_cps(&config);
+            prop_assert!(
+                (result - config.target_cps).abs() < f64::EPSILON,
+                "BinarySearch without config: expected target_cps={}, got {}",
+                config.target_cps, result
+            );
+        }
+
+        /// BinarySearch モードの effective_cps は常に target_cps より大きいこと
+        /// （binary_search 設定ありの場合）
+        #[test]
+        fn prop_effective_cps_binary_search_exceeds_target(
+            mut config in generators::arb_config(),
+            bs in generators::arb_binary_search_config()
+        ) {
+            config.mode = RunMode::BinarySearch;
+            config.binary_search = Some(bs);
+            let result = compute_effective_cps(&config);
+            prop_assert!(
+                result > config.target_cps || (result - config.target_cps).abs() < f64::EPSILON,
+                "BinarySearch effective_cps={} should be > target_cps={}",
+                result, config.target_cps
+            );
+        }
+
+        /// BinarySearch モードの effective_cps は target_cps × 2 を超えないこと
+        #[test]
+        fn prop_effective_cps_binary_search_capped(
+            mut config in generators::arb_config(),
+            bs in generators::arb_binary_search_config()
+        ) {
+            config.mode = RunMode::BinarySearch;
+            config.binary_search = Some(bs);
+            let result = compute_effective_cps(&config);
+            let cap = config.target_cps * 2.0;
+            prop_assert!(
+                result <= cap + f64::EPSILON,
+                "BinarySearch effective_cps={} should be <= cap={}",
+                result, cap
+            );
+        }
+    }
+
+    // ===== compute_effective_cps ユニットテスト =====
+    // Feature: auto-max-dialogs
+    // Requirements: 2.1, 2.2, 2.3, 2.4
+
+    #[test]
+    fn test_compute_effective_cps_sustained_mode() {
+        // Sustained モードでは target_cps がそのまま返る
+        let config = Config {
+            mode: RunMode::Sustained,
+            target_cps: 100.0,
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 100.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_step_up_with_config() {
+        // StepUp モードで step_up 設定ありの場合、max_cps が返る
+        let config = Config {
+            mode: RunMode::StepUp,
+            target_cps: 100.0,
+            step_up: Some(StepUpConfig {
+                initial_cps: 10.0,
+                max_cps: 200.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 200.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_step_up_without_config() {
+        // StepUp モードで step_up 設定なしの場合、target_cps にフォールバック
+        let config = Config {
+            mode: RunMode::StepUp,
+            target_cps: 100.0,
+            step_up: None,
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 100.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_binary_search_with_config() {
+        // BinarySearch モード: initial_cps=10, target_cps=100
+        // 10 → 20 → 40 → 80 → 160 (> 100)、上限 100*2=200 → 160
+        let config = Config {
+            mode: RunMode::BinarySearch,
+            target_cps: 100.0,
+            binary_search: Some(BinarySearchConfig {
+                initial_cps: 10.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+                convergence_threshold: 1.0,
+                cooldown_duration: 5,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 160.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_binary_search_cap() {
+        // BinarySearch モード: initial_cps=1, target_cps=50
+        // 1 → 2 → 4 → 8 → 16 → 32 → 64 (> 50)、上限 50*2=100 → 64
+        let config = Config {
+            mode: RunMode::BinarySearch,
+            target_cps: 50.0,
+            binary_search: Some(BinarySearchConfig {
+                initial_cps: 1.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+                convergence_threshold: 1.0,
+                cooldown_duration: 5,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 64.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_binary_search_initial_exceeds_target() {
+        // BinarySearch モード: initial_cps=200 > target_cps=100
+        // ループ即終了、200 は上限 100*2=200 以内 → 200
+        let config = Config {
+            mode: RunMode::BinarySearch,
+            target_cps: 100.0,
+            binary_search: Some(BinarySearchConfig {
+                initial_cps: 200.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+                convergence_threshold: 1.0,
+                cooldown_duration: 5,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 200.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_binary_search_initial_exceeds_cap() {
+        // BinarySearch モード: initial_cps=300 > target_cps=100
+        // ループ即終了、300 > 上限 100*2=200 → 200 にキャップ
+        let config = Config {
+            mode: RunMode::BinarySearch,
+            target_cps: 100.0,
+            binary_search: Some(BinarySearchConfig {
+                initial_cps: 300.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+                convergence_threshold: 1.0,
+                cooldown_duration: 5,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 200.0);
+    }
+
+    #[test]
+    fn test_compute_effective_cps_binary_search_without_config() {
+        // BinarySearch モードで binary_search 設定なしの場合、target_cps にフォールバック
+        let config = Config {
+            mode: RunMode::BinarySearch,
+            target_cps: 100.0,
+            binary_search: None,
+            ..Config::default()
+        };
+        assert_eq!(compute_effective_cps(&config), 100.0);
+    }
+
+    // ===== Property 1: 計算式の正当性 =====
+    // Feature: auto-max-dialogs, Property 1: 計算式の正当性
+    // `calculate_max_dialogs(config)` が `ceil(effective_cps × call_duration × margin_factor)` と等しく、
+    // 最小値 1 以上であること
+    // **Validates: Requirements 1.1, 1.4**
+
+    proptest! {
+        /// calculate_max_dialogs の結果が独立計算した
+        /// ceil(effective_cps × call_duration × margin_factor) と一致すること
+        #[test]
+        fn prop_calculate_max_dialogs_formula(config in generators::arb_config()) {
+            let result = calculate_max_dialogs(&config);
+
+            // 独立に期待値を計算
+            let effective_cps = compute_effective_cps(&config);
+            let margin_factor = compute_margin_factor(&config);
+            let raw = effective_cps * config.call_duration as f64 * margin_factor;
+            let expected = raw.ceil().max(1.0) as usize;
+
+            prop_assert_eq!(
+                result, expected,
+                "effective_cps={}, call_duration={}, margin_factor={}, raw={}, expected={}, got={}",
+                effective_cps, config.call_duration, margin_factor, raw, expected, result
+            );
+        }
+
+        /// calculate_max_dialogs の結果は常に 1 以上であること
+        #[test]
+        fn prop_calculate_max_dialogs_minimum_is_1(config in generators::arb_config()) {
+            let result = calculate_max_dialogs(&config);
+            prop_assert!(
+                result >= 1,
+                "calculate_max_dialogs must be >= 1, got {}",
+                result
+            );
+        }
+    }
+
+    // ===== calculate_max_dialogs ユニットテスト =====
+    // Feature: auto-max-dialogs
+    // Requirements: 1.1, 1.4
+
+    #[test]
+    fn test_calculate_max_dialogs_basic() {
+        // target_cps=100, call_duration=30, session_expires=300 (default)
+        // effective_cps=100, margin_factor=1.2 (300/2=150 >= 30)
+        // result = ceil(100 * 30 * 1.2) = ceil(3600.0) = 3600
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 3600);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_with_session_timer_overlap() {
+        // target_cps=100, call_duration=30, session_expires=40
+        // effective_cps=100, margin_factor=1.3 (40/2=20 < 30)
+        // result = ceil(100 * 30 * 1.3) = ceil(3900.0) = 3900
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 40,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 3900);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_fractional_ceil() {
+        // target_cps=10.0, call_duration=3, session_expires=300
+        // effective_cps=10.0, margin_factor=1.2
+        // result = ceil(10.0 * 3 * 1.2) = ceil(36.0) = 36
+        let config = Config {
+            target_cps: 10.0,
+            call_duration: 3,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 36);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_fractional_ceil_rounds_up() {
+        // target_cps=7.0, call_duration=3, session_expires=300
+        // effective_cps=7.0, margin_factor=1.2
+        // result = ceil(7.0 * 3 * 1.2) = ceil(25.2) = 26
+        let config = Config {
+            target_cps: 7.0,
+            call_duration: 3,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 26);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_minimum_is_1() {
+        // target_cps が非常に小さい場合でも最小値 1 を保証
+        // target_cps=0.001, call_duration=1, session_expires=300
+        // effective_cps=0.001, margin_factor=1.2
+        // result = ceil(0.001 * 1 * 1.2) = ceil(0.0012) = 1
+        let config = Config {
+            target_cps: 0.001,
+            call_duration: 1,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 1);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_call_duration_zero() {
+        // call_duration=0 の場合、result = ceil(0) = 0 → max(1) = 1
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 0,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 1);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_step_up_mode() {
+        // StepUp モード: max_cps=200, call_duration=30, session_expires=300
+        // effective_cps=200, margin_factor=1.2
+        // result = ceil(200 * 30 * 1.2) = ceil(7200.0) = 7200
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::StepUp,
+            step_up: Some(StepUpConfig {
+                initial_cps: 10.0,
+                max_cps: 200.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 7200);
+    }
+
+    #[test]
+    fn test_calculate_max_dialogs_binary_search_mode() {
+        // BinarySearch モード: initial_cps=10, target_cps=100
+        // effective_cps: 10→20→40→80→160 (>100), cap=200 → 160
+        // margin_factor=1.2, call_duration=30
+        // result = ceil(160 * 30 * 1.2) = ceil(5760.0) = 5760
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::BinarySearch,
+            binary_search: Some(BinarySearchConfig {
+                initial_cps: 10.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+                convergence_threshold: 1.0,
+                cooldown_duration: 5,
+            }),
+            ..Config::default()
+        };
+        assert_eq!(calculate_max_dialogs(&config), 5760);
+    }
+
+    // ===== Property 6: 冪等性 =====
+    // Feature: auto-max-dialogs, Property 6: 冪等性
+    // 同じ Config で複数回呼び出しても同じ値を返すこと
+    // **Validates: Requirements 7.1**
+
+    proptest! {
+        /// calculate_max_dialogs は同じ Config に対して常に同じ値を返すこと
+        #[test]
+        fn prop_calculate_max_dialogs_idempotent(config in generators::arb_config()) {
+            let first = calculate_max_dialogs(&config);
+            let second = calculate_max_dialogs(&config);
+            let third = calculate_max_dialogs(&config);
+
+            prop_assert_eq!(
+                first, second,
+                "1回目と2回目の結果が異なる: first={}, second={}",
+                first, second
+            );
+            prop_assert_eq!(
+                second, third,
+                "2回目と3回目の結果が異なる: second={}, third={}",
+                second, third
+            );
+        }
+    }
+
+    // ===== Property 7: メタモルフィック特性（マージン保証） =====
+    // Feature: auto-max-dialogs, Property 7: メタモルフィック特性（マージン保証）
+    // `calculate_max_dialogs(config) >= effective_cps × call_duration` であること
+    // **Validates: Requirements 7.2**
+
+    proptest! {
+        /// calculate_max_dialogs の結果はマージンなしの理論値（effective_cps × call_duration）以上であること
+        #[test]
+        fn prop_calculate_max_dialogs_margin_guarantee(config in generators::arb_config()) {
+            let result = calculate_max_dialogs(&config);
+            let effective_cps = compute_effective_cps(&config);
+            let baseline = effective_cps * config.call_duration as f64;
+
+            prop_assert!(
+                result as f64 >= baseline,
+                "マージン保証違反: result={}, baseline(effective_cps × call_duration)={:.2} \
+                 (effective_cps={:.2}, call_duration={})",
+                result, baseline, effective_cps, config.call_duration
+            );
+        }
+    }
+
+    // ===== Property 8: 単調増加特性 =====
+    // Feature: auto-max-dialogs, Property 8: 単調増加特性
+    // `effective_cps` が増加した場合、計算結果も増加または同値であること
+    // **Validates: Requirements 7.3**
+
+    proptest! {
+        /// effective_cps が増加した場合、calculate_max_dialogs の結果も増加または同値であること。
+        /// Sustained モードで target_cps のみを変化させ、他のパラメータは固定する。
+        #[test]
+        fn prop_calculate_max_dialogs_monotonic_increasing(
+            config in generators::arb_config(),
+            delta in 0.0f64..1000.0,
+        ) {
+            // ベース Config を Sustained モードに固定（target_cps = effective_cps となる）
+            let mut config_low = config.clone();
+            config_low.mode = RunMode::Sustained;
+            config_low.step_up = None;
+            config_low.binary_search = None;
+
+            // effective_cps を delta 分だけ増加させた Config
+            let mut config_high = config_low.clone();
+            config_high.target_cps = config_low.target_cps + delta;
+
+            let result_low = calculate_max_dialogs(&config_low);
+            let result_high = calculate_max_dialogs(&config_high);
+
+            prop_assert!(
+                result_high >= result_low,
+                "単調増加特性違反: target_cps={:.2} → result={}, target_cps={:.2} → result={} \
+                 (call_duration={}, session_expires={})",
+                config_low.target_cps, result_low,
+                config_high.target_cps, result_high,
+                config_low.call_duration, config_low.session_expires
+            );
+        }
+    }
+
+    // ===== calculate_max_dialogs_breakdown テスト =====
+
+    #[test]
+    fn test_breakdown_matches_calculate_max_dialogs() {
+        // breakdown の result は calculate_max_dialogs と一致すること
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        let breakdown = calculate_max_dialogs_breakdown(&config);
+        assert_eq!(breakdown.result, calculate_max_dialogs(&config));
+    }
+
+    #[test]
+    fn test_breakdown_effective_cps_sustained() {
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        let breakdown = calculate_max_dialogs_breakdown(&config);
+        assert_eq!(breakdown.effective_cps, 100.0);
+        assert_eq!(breakdown.call_duration, 30);
+        assert_eq!(breakdown.margin_factor, 1.2);
+        assert_eq!(breakdown.result, 3600);
+    }
+
+    #[test]
+    fn test_breakdown_margin_factor_with_session_timer_overlap() {
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 40,
+            mode: RunMode::Sustained,
+            ..Config::default()
+        };
+        let breakdown = calculate_max_dialogs_breakdown(&config);
+        assert_eq!(breakdown.margin_factor, 1.3);
+        assert_eq!(breakdown.result, 3900);
+    }
+
+    #[test]
+    fn test_breakdown_step_up_mode() {
+        let config = Config {
+            target_cps: 100.0,
+            call_duration: 30,
+            session_expires: 300,
+            mode: RunMode::StepUp,
+            step_up: Some(StepUpConfig {
+                initial_cps: 10.0,
+                max_cps: 200.0,
+                step_size: 10.0,
+                step_duration: 30,
+                error_threshold: 0.05,
+            }),
+            ..Config::default()
+        };
+        let breakdown = calculate_max_dialogs_breakdown(&config);
+        assert_eq!(breakdown.effective_cps, 200.0);
+        assert_eq!(breakdown.result, 7200);
+    }
+
+    proptest! {
+        /// breakdown の result は calculate_max_dialogs と常に一致すること
+        #[test]
+        fn prop_breakdown_result_matches_calculate(config in generators::arb_config()) {
+            let breakdown = calculate_max_dialogs_breakdown(&config);
+            let direct = calculate_max_dialogs(&config);
+            prop_assert_eq!(
+                breakdown.result, direct,
+                "breakdown.result={} != calculate_max_dialogs={}",
+                breakdown.result, direct
+            );
+        }
+    }
+
 }

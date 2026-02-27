@@ -67,7 +67,6 @@ cat > "$BENCH_CFG" << 'EOF'
   "uas_port": 5080,
   "uas_port_count": 4,
   "target_cps": 500.0,
-  "max_dialogs": 5000,
   "duration": 30,
   "scenario": "invite_bye",
   "call_duration": 30,

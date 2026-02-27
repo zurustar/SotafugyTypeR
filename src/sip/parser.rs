@@ -47,6 +47,160 @@ pub fn parse_sip_message(input: &[u8]) -> Result<SipMessage, ParseError> {
     }
 }
 
+/// Parse a SIP message from raw bytes using a pooled MessageBuf.
+///
+/// Uses the provided MessageBuf's string buffers to avoid heap allocations.
+/// After parsing, the MessageBuf's parser fields are empty (taken via std::mem::take).
+/// The caller should return the MessageBuf to the pool after use.
+pub fn parse_sip_message_pooled(
+    input: &[u8],
+    buf: &mut super::pool::MessageBuf,
+) -> Result<SipMessage, ParseError> {
+    if input.is_empty() {
+        return Err(ParseError::new("empty input"));
+    }
+
+    if input.starts_with(b"SIP/") {
+        parse_response_pooled(input, buf)
+    } else {
+        parse_request_pooled(input, buf)
+    }
+}
+
+/// Parse a full SIP request message using pooled MessageBuf buffers.
+fn parse_request_pooled(
+    input: &[u8],
+    buf: &mut super::pool::MessageBuf,
+) -> Result<SipMessage, ParseError> {
+    let (remaining, (method_bytes, uri_bytes, version_bytes)) =
+        parse_request_line(input)
+            .map_err(|e| ParseError::new(format!("invalid request line: {}", e)))?;
+
+    let method_str = std::str::from_utf8(method_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in method"))?;
+    let uri_str = std::str::from_utf8(uri_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in request URI"))?;
+    let version_str = std::str::from_utf8(version_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?;
+
+    if !version_str.starts_with("SIP/") {
+        return Err(ParseError::new(format!("invalid SIP version: {}", version_str)));
+    }
+
+    let method = parse_method(method_str);
+
+    // Write into MessageBuf string buffers, then take ownership
+    buf.request_uri.clear();
+    buf.request_uri.push_str(uri_str);
+    let request_uri = std::mem::take(&mut buf.request_uri);
+
+    buf.version.clear();
+    buf.version.push_str(version_str);
+    let version = std::mem::take(&mut buf.version);
+
+    let (remaining, raw_headers) =
+        parse_headers(remaining)
+            .map_err(|e| ParseError::new(format!("invalid headers: {}", e)))?;
+
+    let headers = build_headers_pooled(buf, &raw_headers)?;
+    let body = parse_body(remaining, &headers)?;
+
+    Ok(SipMessage::Request(SipRequest {
+        method,
+        request_uri,
+        version,
+        headers,
+        body,
+    }))
+}
+
+/// Parse a full SIP response message using pooled MessageBuf buffers.
+fn parse_response_pooled(
+    input: &[u8],
+    buf: &mut super::pool::MessageBuf,
+) -> Result<SipMessage, ParseError> {
+    let (remaining, (version_bytes, status_bytes, reason_bytes)) =
+        parse_status_line(input)
+            .map_err(|e| ParseError::new(format!("invalid status line: {}", e)))?;
+
+    let version_str = std::str::from_utf8(version_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in SIP version"))?;
+    let status_str = std::str::from_utf8(status_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in status code"))?;
+    let status_code: u16 = status_str
+        .parse()
+        .map_err(|_| ParseError::new(format!("invalid status code: {}", status_str)))?;
+    let reason_str = std::str::from_utf8(reason_bytes)
+        .map_err(|_| ParseError::new("invalid UTF-8 in reason phrase"))?;
+
+    if !version_str.starts_with("SIP/") {
+        return Err(ParseError::new(format!("invalid SIP version: {}", version_str)));
+    }
+
+    buf.version.clear();
+    buf.version.push_str(version_str);
+    let version = std::mem::take(&mut buf.version);
+
+    buf.reason_phrase.clear();
+    buf.reason_phrase.push_str(reason_str);
+    let reason_phrase = std::mem::take(&mut buf.reason_phrase);
+
+    let (remaining, raw_headers) =
+        parse_headers(remaining)
+            .map_err(|e| ParseError::new(format!("invalid headers: {}", e)))?;
+
+    let headers = build_headers_pooled(buf, &raw_headers)?;
+    let body = parse_body(remaining, &headers)?;
+
+    Ok(SipMessage::Response(SipResponse {
+        version,
+        status_code,
+        reason_phrase,
+        headers,
+        body,
+    }))
+}
+
+/// Build Headers from raw header pairs using MessageBuf's pre-allocated string buffers.
+/// Expands header_names/header_values if the header count exceeds current capacity.
+fn build_headers_pooled(
+    buf: &mut super::pool::MessageBuf,
+    raw_headers: &[(&[u8], &[u8])],
+) -> Result<Headers, ParseError> {
+    let count = raw_headers.len();
+
+    // Ensure header_names and header_values have enough entries
+    while buf.header_names.len() < count {
+        buf.header_names.push(String::with_capacity(
+            super::pool::DEFAULT_HEADER_NAME_CAPACITY,
+        ));
+    }
+    while buf.header_values.len() < count {
+        buf.header_values.push(String::with_capacity(
+            super::pool::DEFAULT_HEADER_VALUE_CAPACITY,
+        ));
+    }
+
+    let mut headers = Headers::new();
+    for (i, (name_bytes, value_bytes)) in raw_headers.iter().enumerate() {
+        let name_str = std::str::from_utf8(name_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in header name"))?
+            .trim();
+        let value_str = std::str::from_utf8(value_bytes)
+            .map_err(|_| ParseError::new("invalid UTF-8 in header value"))?
+            .trim();
+
+        buf.header_values[i].clear();
+        buf.header_values[i].push_str(value_str);
+        let value = std::mem::take(&mut buf.header_values[i]);
+
+        headers.add(name_str, value);
+    }
+
+    Ok(headers)
+}
+
+
 /// Parse a SIP method string into a Method enum
 fn parse_method(method_str: &str) -> Method {
     match method_str {
@@ -259,7 +413,7 @@ fn parse_body(remaining: &[u8], headers: &Headers) -> Result<Option<Vec<u8>>, Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::formatter::format_sip_message;
+    use crate::sip::formatter::{format_into_pooled, format_sip_message};
     use crate::sip::message::generators::arb_sip_message;
     use crate::sip::message::{Headers, SipMessage, SipRequest, SipResponse};
     use proptest::prelude::*;
@@ -439,6 +593,28 @@ mod tests {
             let parsed = parse_sip_message(&formatted)
                 .expect("format→parse should succeed for any valid SipMessage");
             prop_assert_eq!(normalized, parsed);
+        }
+    }
+
+    // Feature: sip-message-pool, Property 4: プール版パーサーの機能的等価性
+    // **Validates: Requirements 2.1, 2.2**
+    proptest! {
+        /// Property 4: 任意の有効なSipMessageに対して、parse_sip_message_pooled の結果は
+        /// parse_sip_message の結果と等価である
+        #[test]
+        fn prop_pooled_parser_functional_equivalence(msg in arb_sip_message()) {
+            let normalized = normalize_for_roundtrip(&msg);
+            let formatted = format_sip_message(&normalized);
+
+            let expected = parse_sip_message(&formatted)
+                .expect("既存パーサーは有効なメッセージを解析できるべきです");
+
+            let mut buf = crate::sip::pool::MessageBuf::new();
+            let pooled = parse_sip_message_pooled(&formatted, &mut buf)
+                .expect("プール版パーサーは有効なメッセージを解析できるべきです");
+
+            prop_assert_eq!(expected, pooled,
+                "プール版パーサーは既存パーサーと同一の結果を返すべきです");
         }
     }
 
@@ -908,6 +1084,187 @@ mod tests {
                 assert!(resp.body.is_none(), "No Content-Length + empty remaining should produce None body");
             }
             _ => panic!("Expected Response"),
+        }
+    }
+
+    // =========================================================================
+    // Feature: sip-message-pool — parse_sip_message_pooled テスト
+    // Requirements: 2.1, 2.2, 2.3, 2.4
+    // =========================================================================
+
+    /// INVITE リクエストの解析: プール版と既存版の結果が等価であること
+    #[test]
+    fn test_parse_pooled_invite_request_equivalence() {
+        let input = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       From: <sip:alice@example.com>;tag=5678\r\n\
+                       To: <sip:bob@example.com>\r\n\
+                       Call-ID: def456@10.0.0.1\r\n\
+                       CSeq: 1 INVITE\r\n\
+                       \r\n";
+
+        let expected = parse_sip_message(input).unwrap();
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let pooled = parse_sip_message_pooled(input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "プール版パーサーは既存版と同一の結果を返すべきです");
+    }
+
+    /// 200 OK レスポンスの解析: プール版と既存版の結果が等価であること
+    #[test]
+    fn test_parse_pooled_200_ok_response_equivalence() {
+        let input = b"SIP/2.0 200 OK\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       From: <sip:alice@example.com>;tag=1234\r\n\
+                       To: <sip:bob@example.com>;tag=5678\r\n\
+                       Call-ID: abc123@10.0.0.1\r\n\
+                       CSeq: 1 INVITE\r\n\
+                       \r\n";
+
+        let expected = parse_sip_message(input).unwrap();
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let pooled = parse_sip_message_pooled(input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "プール版パーサーは既存版と同一の結果を返すべきです");
+    }
+
+    /// ボディ付きリクエストの解析: プール版と既存版の結果が等価であること
+    #[test]
+    fn test_parse_pooled_request_with_body_equivalence() {
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n";
+        let content_length = body.len();
+        let mut input = format!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            content_length
+        )
+        .into_bytes();
+        input.extend_from_slice(body);
+
+        let expected = parse_sip_message(&input).unwrap();
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let pooled = parse_sip_message_pooled(&input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "ボディ付きメッセージでもプール版と既存版は等価であるべきです");
+    }
+
+    /// ボディ付きレスポンスの解析: プール版と既存版の結果が等価であること
+    #[test]
+    fn test_parse_pooled_response_with_body_equivalence() {
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\n";
+        let content_length = body.len();
+        let mut input = format!(
+            "SIP/2.0 200 OK\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            content_length
+        )
+        .into_bytes();
+        input.extend_from_slice(body);
+
+        let expected = parse_sip_message(&input).unwrap();
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let pooled = parse_sip_message_pooled(&input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "ボディ付きレスポンスでもプール版と既存版は等価であるべきです");
+    }
+
+    /// 不正入力時のエラーハンドリング: エラー返却後も MessageBuf が再利用可能であること
+    #[test]
+    fn test_parse_pooled_error_buf_reusable() {
+        let invalid_input = b"GARBAGE DATA WITHOUT CRLF";
+        let mut buf = crate::sip::pool::MessageBuf::new();
+
+        // 不正入力でエラーが返ること
+        let result = parse_sip_message_pooled(invalid_input, &mut buf);
+        assert!(result.is_err(), "不正入力はエラーを返すべきです");
+
+        // エラー後も buf は再利用可能: 有効なメッセージを正常に解析できること
+        let valid_input = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                             Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                             \r\n";
+        let expected = parse_sip_message(valid_input).unwrap();
+        let pooled = parse_sip_message_pooled(valid_input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "エラー後の MessageBuf で正常に解析できるべきです");
+    }
+
+    /// 空入力時のエラーハンドリング: エラー返却後も MessageBuf が再利用可能であること
+    #[test]
+    fn test_parse_pooled_empty_input_error_buf_reusable() {
+        let mut buf = crate::sip::pool::MessageBuf::new();
+
+        let result = parse_sip_message_pooled(b"", &mut buf);
+        assert!(result.is_err(), "空入力はエラーを返すべきです");
+
+        // エラー後も再利用可能
+        let valid_input = b"SIP/2.0 200 OK\r\n\
+                             Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                             \r\n";
+        let expected = parse_sip_message(valid_input).unwrap();
+        let pooled = parse_sip_message_pooled(valid_input, &mut buf).unwrap();
+        assert_eq!(expected, pooled, "エラー後の MessageBuf で正常に解析できるべきです");
+    }
+
+    /// Content-Length: 0 の場合にボディが None であること
+    #[test]
+    fn test_parse_pooled_content_length_zero_no_body() {
+        let input = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       Content-Length: 0\r\n\
+                       \r\n";
+
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let result = parse_sip_message_pooled(input, &mut buf).unwrap();
+        match result {
+            SipMessage::Request(req) => {
+                assert!(req.body.is_none(), "Content-Length: 0 ではボディは None であるべきです");
+            }
+            _ => panic!("Expected Request"),
+        }
+    }
+
+    /// Content-Length: 0 のレスポンスでもボディが None であること
+    #[test]
+    fn test_parse_pooled_response_content_length_zero_no_body() {
+        let input = b"SIP/2.0 200 OK\r\n\
+                       Content-Length: 0\r\n\
+                       Via: SIP/2.0/UDP 10.0.0.1:5060\r\n\
+                       \r\n";
+
+        let mut buf = crate::sip::pool::MessageBuf::new();
+        let result = parse_sip_message_pooled(input, &mut buf).unwrap();
+        match result {
+            SipMessage::Response(resp) => {
+                assert!(resp.body.is_none(), "Content-Length: 0 ではボディは None であるべきです");
+                assert_eq!(resp.status_code, 200);
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    // Feature: sip-message-pool, Property 5: プール版パーサーのラウンドトリップ
+    // **Validates: Requirements 2.5**
+    proptest! {
+        /// Property 5: 任意の有効なSipMessageに対して、parse_sip_message_pooled → format_into_pooled
+        /// → parse_sip_message_pooled のラウンドトリップで結果が等価である（正規化後）
+        #[test]
+        fn prop_pooled_roundtrip(msg in arb_sip_message()) {
+            let normalized = normalize_for_roundtrip(&msg);
+            let formatted = format_sip_message(&normalized);
+
+            // 1回目: parse_sip_message_pooled
+            let mut buf = crate::sip::pool::MessageBuf::new();
+            let first_parse = parse_sip_message_pooled(&formatted, &mut buf)
+                .expect("1回目のプール版解析は成功するべきです");
+
+            // format_into_pooled で再フォーマット
+            format_into_pooled(&mut buf, &first_parse);
+            let reformatted = buf.output.clone();
+
+            // 2回目: parse_sip_message_pooled
+            let mut buf2 = crate::sip::pool::MessageBuf::new();
+            let second_parse = parse_sip_message_pooled(&reformatted, &mut buf2)
+                .expect("2回目のプール版解析は成功するべきです");
+
+            prop_assert_eq!(first_parse, second_parse,
+                "プール版ラウンドトリップ: parse→format→parse の結果は等価であるべきです");
         }
     }
 }

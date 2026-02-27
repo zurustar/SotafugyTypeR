@@ -202,8 +202,13 @@ pub struct ProxyServerConfig {
     pub auth_enabled: bool,
     pub auth_realm: String,
     pub users_file: Option<String>,
+    pub recv_task_count: usize,  // デフォルト: 4（proxy-parallel-recv で追加）
+    pub bind_count: usize,       // デフォルト: 4（proxy-multi-socket-rport で追加）
+    pub debug: bool,             // デフォルト: false（proxy-debug-logging で追加）
 }
 ```
+
+> **注**: `recv_task_count`, `bind_count`, `debug` フィールドは後続の機能追加で導入されました。詳細は [プロキシ複数ソケット・rport対応](proxy-multi-socket-rport.md)、[プロキシデバッグログ](proxy-debug-logging.md) を参照。
 
 関連関数:
 - `load_proxy_config_from_file(path: &Path) -> Result<ProxyServerConfig, SipLoadTestError>`: ファイルからJSON読み込み+バリデーション
@@ -245,6 +250,9 @@ pub struct ProxyServerConfig {
 | `auth_enabled` | `bool` | No | `false` | Digest認証の有効/無効 |
 | `auth_realm` | `String` | No | `"sip-proxy"` | 認証レルム |
 | `users_file` | `Option<String>` | No | `None` | ユーザファイルパス（認証用） |
+| `recv_task_count` | `usize` | No | `4` | ソケットあたりの受信タスク数 |
+| `bind_count` | `usize` | No | `4` | bindするUDPソケット数 |
+| `debug` | `bool` | No | `false` | デバッグログ有効フラグ |
 
 #### JSON設定ファイル例
 
@@ -256,7 +264,10 @@ pub struct ProxyServerConfig {
   "forward_port": 5080,
   "auth_enabled": true,
   "auth_realm": "sip-proxy",
-  "users_file": "users.json"
+  "users_file": "users.json",
+  "recv_task_count": 4,
+  "bind_count": 4,
+  "debug": false
 }
 ```
 

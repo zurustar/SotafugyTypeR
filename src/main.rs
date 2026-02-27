@@ -1,7 +1,7 @@
 use clap::Parser;
 use sip_load_test::auth::DigestAuth;
 use sip_load_test::cli::{run_compare, run_generate_users, Cli};
-use sip_load_test::config;
+use sip_load_test::config::{self, calculate_max_dialogs_breakdown};
 use sip_load_test::dialog::DialogManager;
 use sip_load_test::orchestrator::Orchestrator;
 use sip_load_test::reporter;
@@ -101,7 +101,24 @@ async fn run_load_test(
         .map_err(|e| sip_load_test::error::SipLoadTestError::ConfigError(
             format!("Invalid proxy address: {}", e)))?;
 
-    let dialog_manager = Arc::new(DialogManager::new(cfg.max_dialogs));
+    let resolved_max_dialogs = match cfg.max_dialogs {
+        Some(n) => {
+            eprintln!("max_dialogs: {} (user-specified)", n);
+            n
+        }
+        None => {
+            let breakdown = calculate_max_dialogs_breakdown(&cfg);
+            eprintln!(
+                "max_dialogs: {} (auto-calculated: effective_cps={:.1}, call_duration={}, margin_factor={:.1})",
+                breakdown.result,
+                breakdown.effective_cps,
+                breakdown.call_duration,
+                breakdown.margin_factor,
+            );
+            breakdown.result
+        }
+    };
+    let dialog_manager = Arc::new(DialogManager::new(resolved_max_dialogs));
     let stats = orchestrator.stats().clone();
 
     let uac_config = UacConfig {

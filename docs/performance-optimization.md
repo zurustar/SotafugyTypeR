@@ -76,7 +76,7 @@ BYE送信を`tokio::time::interval`によるバッチ処理に変更。コール
 | ドレインフェーズ | 各ステップ終了時に最大20秒の固定待機が発生 | 早期終了判定（active_dialogs=0で即座に終了）、タイムアウト時の残存ダイアログ強制クリーンアップ |
 | コール送信 | send_invite/send_registerの逐次awaitでスループット制限 | tokio::JoinSetによる並行発行 |
 | 送信間隔計算 | calculate_send_intervalの粒度が粗くバースト送信に非対応 | 戻り値を`(Duration, u64)`タプルに変更し、高CPS時のバッチ送信に対応 |
-| ベンチマーク設定 | max_dialogs=500で高CPS時にMaxDialogsReached頻発 | CPSとcall_durationに基づく動的算出（`target_cps × call_duration × 2`以上） |
+| ベンチマーク設定 | max_dialogs=500で高CPS時にMaxDialogsReached頻発 | CPSとcall_durationに基づく動的算出（詳細は [SIP負荷試験ツール](sip-load-tester.md) の max_dialogs 自動計算セクションを参照） |
 | StatsCollector | 並行送信環境下での統計整合性が未検証 | 並行安全性の検証と保証 |
 | プロファイリング環境 | プロファイリング手順が未整備 | デバッグシンボル付きリリースビルドとsamplyプロファイリングスクリプト整備 |
 
@@ -107,13 +107,7 @@ BYE送信を`tokio::time::interval`によるバッチ処理に変更。コール
 
 #### ベンチマーク設定の最適化
 
-`bench_profile.sh`のベンチマーク設定パラメータを最適化しました。
-
-| パラメータ | 最適化前 | 最適化後 | 根拠 |
-|-----------|---------|---------|------|
-| max_dialogs | 500 | `target_cps × call_duration × 2`以上 | MaxDialogsReached防止 |
-| call_duration | 15s | 3〜5s | ベンチマーク高速化 |
-| shutdown_timeout | 5s | call_duration以下 | ドレイン時間短縮 |
+`bench_profile.sh`のベンチマーク設定パラメータを最適化しました。`max_dialogs` は自動計算に移行し、`call_duration` と `shutdown_timeout` を短縮してベンチマーク高速化を実現しています。
 
 #### StatsCollectorの並行安全性保証
 
@@ -131,3 +125,46 @@ BYE送信を`tokio::time::interval`によるバッチ処理に変更。コール
 6. 送信間隔の精度: 実効CPSが目標CPSの±5%以内
 7. 高CPSでのバッチ送信: CPS≥100でbatch_size>1
 8. 送信間隔の安全性: 任意のf64入力でパニックせず、intervalが1ms〜100ms範囲内
+
+## recv_loop タスク生成オーバーヘッドの排除（第3フェーズ）
+
+### はじめに
+
+第2フェーズの最適化後、samplyプロファイラによる追加分析で `recv_loop` 内のメッセージディスパッチにおける `tokio::spawn` が新たなボトルネックとして特定されました。CPU時間の約52%がタスク生成・解放のオーバーヘッドに費やされていました。
+
+- 47.0%: `__rust_dealloc`/`free()`（タスクのメモリ解放）
+- 5.3%: `Harness::complete`（tokioタスクのクリーンアップ）
+
+### 最適化領域
+
+| 領域 | 問題 | 対策 |
+|------|------|------|
+| recv_loop メッセージディスパッチ | 受信メッセージごとに `tokio::spawn` で新規タスク生成 | インライン `.await` に置き換え |
+| Arc クローン | `tokio::spawn` 用に毎回 `Arc<SipProxy>` をクローン | クローン不要（ループ外の参照を直接使用） |
+
+### 設計方針
+
+- 最小限の変更: `recv_loop` 内のメッセージディスパッチブロック1箇所のみを変更
+- 関数シグネチャ不変: `recv_loop` の引数・戻り値型は一切変更しない
+- 並行性の維持: `main` 関数が `bind_count × recv_task_count` 個の `recv_loop` タスクを起動する構造は変更なし
+- TDDアプローチ: テストファーストで実装
+
+### 変更内容
+
+`recv_loop` 関数内のメッセージディスパッチブロックから `tokio::spawn` ラッパーと `Arc<SipProxy>` クローンを削除し、`handle_request` / `handle_response` をインラインで `.await` する方式に変更しました。
+
+変更前は各 `recv_loop` タスク内でさらに `tokio::spawn` による二重並行化が行われていましたが、`handle_request` / `handle_response` はSIPメッセージの加工とUDP送信を行う比較的高速な処理であり、タスク生成のオーバーヘッドが並行化の恩恵を上回っていました。
+
+### 正当性プロパティ
+
+以下のプロパティをproptestで検証済み:
+
+1. エラー耐性: `handle_request` / `handle_response` がエラーを返した場合でも `recv_loop` が停止せず次のメッセージ受信を継続する（100イテレーション）
+
+### ベンチマーク結果
+
+| 指標 | 変更前 | 変更後 |
+|------|--------|--------|
+| max_stable_cps | 1,680 | 1,680 |
+
+ベースラインCPS（1,680）を維持しており、性能リグレッションなしを確認しました。

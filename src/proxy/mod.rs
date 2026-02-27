@@ -7,7 +7,6 @@
 // - Routes in-dialog requests (ACK, BYE, re-INVITE) based on Route header
 // - Maintains no transaction state (stateless operation)
 
-use std::cell::RefCell;
 use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,24 +16,10 @@ use dashmap::DashMap;
 
 use crate::auth::ProxyAuth;
 use crate::error::SipLoadTestError;
-use crate::sip::formatter::format_into;
+use crate::sip::formatter::format_into_pooled;
 use crate::sip::message::{Headers, Method, SipMessage, SipRequest, SipResponse};
+use crate::sip::pool::MessagePool;
 use crate::uas::SipTransport;
-
-thread_local! {
-    static FMT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
-}
-
-/// Thread-local buffer を使用して SipMessage をフォーマットし、バイト列を返す。
-/// バッファは再利用されるため、毎回のヒープアロケーションを回避する。
-fn format_message_reuse(msg: &SipMessage) -> Vec<u8> {
-    FMT_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-        format_into(&mut buf, msg);
-        buf.clone()
-    })
-}
 
 /// Contact information stored in the Location Service.
 #[derive(Debug, Clone)]
@@ -88,6 +73,7 @@ pub struct SipProxy {
     location_service: Arc<LocationService>,
     auth: Option<ProxyAuth>,
     config: ProxyConfig,
+    pool: Arc<MessagePool>,
 }
 
 impl SipProxy {
@@ -97,12 +83,14 @@ impl SipProxy {
         location_service: Arc<LocationService>,
         auth: Option<ProxyAuth>,
         config: ProxyConfig,
+        pool: Arc<MessagePool>,
     ) -> Self {
         Self {
             transport,
             location_service,
             auth,
             config,
+            pool,
         }
     }
 
@@ -144,14 +132,20 @@ impl SipProxy {
                                 "WWW-Authenticate",
                                 Self::format_challenge(&challenge),
                             );
-                            let data = format_message_reuse(&SipMessage::Response(response));
-                            self.transport.send_to(&data, from).await?;
+                            let mut buf = self.pool.get();
+                            format_into_pooled(&mut buf, &SipMessage::Response(response));
+                            let result = self.transport.send_to(&buf.output, from).await;
+                            self.pool.put(buf);
+                            result?;
                             return Ok(());
                         } else if !auth.verify(&msg) {
                             // Auth header present but invalid → 403
                             let response = self.build_response(&req, 403, "Forbidden");
-                            let data = format_message_reuse(&SipMessage::Response(response));
-                            self.transport.send_to(&data, from).await?;
+                            let mut buf = self.pool.get();
+                            format_into_pooled(&mut buf, &SipMessage::Response(response));
+                            let result = self.transport.send_to(&buf.output, from).await;
+                            self.pool.put(buf);
+                            result?;
                             return Ok(());
                         }
                         // Auth valid → proceed
@@ -173,14 +167,20 @@ impl SipProxy {
                                 "Proxy-Authenticate",
                                 Self::format_challenge(&challenge),
                             );
-                            let data = format_message_reuse(&SipMessage::Response(response));
-                            self.transport.send_to(&data, from).await?;
+                            let mut buf = self.pool.get();
+                            format_into_pooled(&mut buf, &SipMessage::Response(response));
+                            let result = self.transport.send_to(&buf.output, from).await;
+                            self.pool.put(buf);
+                            result?;
                             return Ok(());
                         } else if !auth.verify(&msg) {
                             // Auth header present but invalid → 403
                             let response = self.build_response(&req, 403, "Forbidden");
-                            let data = format_message_reuse(&SipMessage::Response(response));
-                            self.transport.send_to(&data, from).await?;
+                            let mut buf = self.pool.get();
+                            format_into_pooled(&mut buf, &SipMessage::Response(response));
+                            let result = self.transport.send_to(&buf.output, from).await;
+                            self.pool.put(buf);
+                            result?;
                             return Ok(());
                         }
                         // Auth valid → proceed
@@ -280,8 +280,11 @@ impl SipProxy {
                             eprintln!("{}", format_fwd_req_log(method, call_id, dest));
                         }
 
-                        let data = format_message_reuse(&SipMessage::Request(request));
-                        if let Err(e) = self.transport.send_to(&data, dest).await {
+                        let mut buf = self.pool.get();
+                        format_into_pooled(&mut buf, &SipMessage::Request(request));
+                        let result = self.transport.send_to(&buf.output, dest).await;
+                        self.pool.put(buf);
+                        if let Err(e) = result {
                             if self.config.debug {
                                 eprintln!("{}", format_req_error_log(&e.to_string(), "INVITE", "<unknown>", dest));
                             }
@@ -292,8 +295,11 @@ impl SipProxy {
                     None => {
                         // User not registered in our domain → 404
                         let response = self.build_response(&request, 404, "Not Found");
-                        let data = format_message_reuse(&SipMessage::Response(response));
-                        self.transport.send_to(&data, from).await?;
+                        let mut buf = self.pool.get();
+                        format_into_pooled(&mut buf, &SipMessage::Response(response));
+                        let result = self.transport.send_to(&buf.output, from).await;
+                        self.pool.put(buf);
+                        result?;
                         return Ok(());
                     }
                 }
@@ -319,8 +325,11 @@ impl SipProxy {
         }
 
         // Forward the request
-        let data = format_message_reuse(&SipMessage::Request(request));
-        if let Err(e) = self.transport.send_to(&data, dest).await {
+        let mut buf = self.pool.get();
+        format_into_pooled(&mut buf, &SipMessage::Request(request));
+        let result = self.transport.send_to(&buf.output, dest).await;
+        self.pool.put(buf);
+        if let Err(e) = result {
             if self.config.debug {
                 eprintln!("{}", format_req_error_log(&e.to_string(), "<unknown>", "<unknown>", dest));
             }
@@ -375,8 +384,11 @@ impl SipProxy {
         }
 
         // Forward the response
-        let data = format_message_reuse(&SipMessage::Response(response));
-        if let Err(e) = self.transport.send_to(&data, dest).await {
+        let mut buf = self.pool.get();
+        format_into_pooled(&mut buf, &SipMessage::Response(response));
+        let result = self.transport.send_to(&buf.output, dest).await;
+        self.pool.put(buf);
+        if let Err(e) = result {
             if self.config.debug {
                 let call_id = call_id_owned.as_deref().unwrap_or("<unknown>");
                 eprintln!("{}", format_res_error_log(&e.to_string(), status_code, call_id, dest));
@@ -416,8 +428,11 @@ impl SipProxy {
 
         // Send 200 OK response
         let response = self.build_response(&request, 200, "OK");
-        let data = format_message_reuse(&SipMessage::Response(response));
-        self.transport.send_to(&data, from).await?;
+        let mut buf = self.pool.get();
+        format_into_pooled(&mut buf, &SipMessage::Response(response));
+        let result = self.transport.send_to(&buf.output, from).await;
+        self.pool.put(buf);
+        result?;
 
         Ok(())
     }
@@ -752,14 +767,16 @@ mod tests {
 
     fn make_proxy(transport: Arc<MockTransport>) -> SipProxy {
         let location_service = Arc::new(LocationService::new());
-        SipProxy::new(transport, location_service, None, proxy_config())
+        let pool = Arc::new(MessagePool::new(16));
+        SipProxy::new(transport, location_service, None, proxy_config(), pool)
     }
 
     fn make_proxy_with_location_service(
         transport: Arc<MockTransport>,
         location_service: Arc<LocationService>,
     ) -> SipProxy {
-        SipProxy::new(transport, location_service, None, proxy_config())
+        let pool = Arc::new(MessagePool::new(16));
+        SipProxy::new(transport, location_service, None, proxy_config(), pool)
     }
 
     fn make_invite(call_id: &str) -> SipMessage {
@@ -1784,7 +1801,8 @@ mod tests {
         use crate::auth::ProxyAuth;
         let pool = make_user_pool();
         let auth = ProxyAuth::new("example.com".to_string(), pool);
-        SipProxy::new(transport, location_service, Some(auth), proxy_config())
+        let msg_pool = Arc::new(MessagePool::new(16));
+        SipProxy::new(transport, location_service, Some(auth), proxy_config(), msg_pool)
     }
 
     fn make_invite_with_proxy_auth(call_id: &str, auth_header: &str) -> SipMessage {
@@ -2268,7 +2286,8 @@ mod tests {
 
     fn make_debug_proxy(transport: Arc<MockTransport>) -> SipProxy {
         let location_service = Arc::new(LocationService::new());
-        SipProxy::new(transport, location_service, None, make_debug_proxy_config())
+        let pool = Arc::new(MessagePool::new(16));
+        SipProxy::new(transport, location_service, None, make_debug_proxy_config(), pool)
     }
 
     #[tokio::test]
@@ -4004,7 +4023,8 @@ mod tests {
             };
             let transport = Arc::new(MockTransport::new());
             let location_service = Arc::new(LocationService::new());
-            let proxy = SipProxy::new(transport, location_service, None, config);
+            let pool = Arc::new(MessagePool::new(4));
+            let proxy = SipProxy::new(transport, location_service, None, config, pool);
 
             let via = proxy.build_via_value();
 
@@ -4019,5 +4039,282 @@ mod tests {
                 via
             );
         }
+    }
+
+    // =========================================================================
+    // Task 7.1: MessagePool 統合テスト
+    // Requirements: 4.1, 4.4, 4.5
+    // =========================================================================
+
+    use crate::sip::pool::MessagePool;
+
+    /// make_proxy ヘルパーのプール対応版。
+    /// タスク7.2で SipProxy::new にプールパラメータが追加された後に使用する。
+    fn make_proxy_with_pool(transport: Arc<MockTransport>) -> SipProxy {
+        let location_service = Arc::new(LocationService::new());
+        let pool = Arc::new(MessagePool::new(16));
+        SipProxy::new(transport, location_service, None, proxy_config(), pool)
+    }
+
+    /// プロキシ初期化時に Arc<MessagePool> が設定されること (Req 4.1)
+    #[test]
+    fn test_proxy_initializes_with_message_pool() {
+        let transport = Arc::new(MockTransport::new());
+        let pool = Arc::new(MessagePool::new(8));
+        let proxy = SipProxy::new(
+            transport,
+            Arc::new(LocationService::new()),
+            None,
+            proxy_config(),
+            pool.clone(),
+        );
+        // プールが共有されていることを確認（Arc の参照カウントが2）
+        assert_eq!(Arc::strong_count(&pool), 2);
+        // プールの初期バッファ数が正しいこと
+        assert_eq!(pool.available(), 8);
+    }
+
+    /// プール統合後も既存のリクエスト転送が正常に動作すること (Req 4.4, 4.5)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_forwards_invite() {
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy_with_pool(transport.clone());
+
+        let invite = make_invite("call-pool-1");
+        proxy.handle_request(invite, uac_addr()).await;
+
+        let sent = transport.sent_requests();
+        assert_eq!(sent.len(), 1);
+        let (req, dest) = &sent[0];
+        assert_eq!(req.method, Method::Invite);
+        assert_eq!(*dest, uas_addr());
+    }
+
+    /// プール統合後もレスポンス転送が正常に動作すること (Req 4.4, 4.5)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_forwards_response() {
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy_with_pool(transport.clone());
+
+        let response = make_200ok_response("call-pool-2");
+        proxy.handle_response(response, uas_addr()).await;
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        let (resp, _dest) = &sent[0];
+        assert_eq!(resp.status_code, 200);
+    }
+
+    /// プール統合後もViaヘッダの追加・削除が正しく動作すること (Req 4.4)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_via_handling() {
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy_with_pool(transport.clone());
+
+        // リクエスト転送: Viaが追加されること
+        let invite = make_invite("call-pool-via");
+        proxy.handle_request(invite, uac_addr()).await;
+
+        let sent = transport.sent_requests();
+        assert_eq!(sent.len(), 1);
+        let (req, _) = &sent[0];
+        let via_headers = req.headers.get_all("Via");
+        // 元のVia + プロキシのVia = 2つ
+        assert_eq!(via_headers.len(), 2);
+        assert!(via_headers[0].contains("10.0.0.100"));
+    }
+
+    /// プール統合後もRecord-Route挿入が正しく動作すること (Req 4.4)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_record_route() {
+        let transport = Arc::new(MockTransport::new());
+        let proxy = make_proxy_with_pool(transport.clone());
+
+        let invite = make_invite("call-pool-rr");
+        proxy.handle_request(invite, uac_addr()).await;
+
+        let sent = transport.sent_requests();
+        assert_eq!(sent.len(), 1);
+        let (req, _) = &sent[0];
+        let rr = req.headers.get("Record-Route");
+        assert!(rr.is_some());
+        assert!(rr.unwrap().contains("10.0.0.100"));
+    }
+
+    /// プール統合後もREGISTER処理が正しく動作すること (Req 4.4)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_register() {
+        let transport = Arc::new(MockTransport::new());
+        let location_service = Arc::new(LocationService::new());
+        let pool = Arc::new(MessagePool::new(16));
+        let proxy = SipProxy::new(
+            transport.clone(),
+            location_service,
+            None,
+            proxy_config(),
+            pool,
+        );
+
+        let register = make_register("call-pool-reg");
+        proxy.handle_request(register, uac_addr()).await;
+
+        // 200 OK が返されること
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        let (resp, dest) = &sent[0];
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(*dest, uac_addr());
+    }
+
+    /// プール統合後も認証機能が正しく動作すること (Req 4.4)
+    #[tokio::test]
+    async fn test_pool_integrated_proxy_auth_challenge() {
+        let transport = Arc::new(MockTransport::new());
+        let location_service = Arc::new(LocationService::new());
+        let user_pool = make_user_pool();
+        let auth = crate::auth::ProxyAuth::new("example.com".to_string(), user_pool);
+        let pool = Arc::new(MessagePool::new(16));
+        let proxy = SipProxy::new(
+            transport.clone(),
+            location_service,
+            Some(auth),
+            proxy_config(),
+            pool,
+        );
+
+        // 認証なしINVITEは407を返すこと
+        let invite = make_invite("call-pool-auth");
+        proxy.handle_request(invite, uac_addr()).await;
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        let (resp, _) = &sent[0];
+        assert_eq!(resp.status_code, 407);
+    }
+
+    /// forward_request がプール版フォーマッターを使用し、バッファを返却すること (Req 4.2, 4.3)
+    #[tokio::test]
+    async fn test_forward_request_uses_pool_and_returns_buf() {
+        let transport = Arc::new(MockTransport::new());
+        let pool = Arc::new(MessagePool::new(0)); // 空プールで開始
+        let proxy = SipProxy::new(
+            transport.clone(),
+            Arc::new(LocationService::new()),
+            None,
+            proxy_config(),
+            pool.clone(),
+        );
+
+        assert_eq!(pool.available(), 0, "初期状態でプールは空");
+        let invite = make_invite("call-pool-fwd");
+        proxy.handle_request(invite, uac_addr()).await.unwrap();
+
+        // プール版を使用していれば、get()で新規作成→put()で返却→プールが1つ増える
+        assert_eq!(pool.available(), 1, "処理後にバッファがプールに返却されるべき");
+
+        let sent = transport.sent_requests();
+        assert_eq!(sent.len(), 1);
+    }
+
+    /// forward_response がプール版フォーマッターを使用し、バッファを返却すること (Req 4.2, 4.3)
+    #[tokio::test]
+    async fn test_forward_response_uses_pool_and_returns_buf() {
+        let transport = Arc::new(MockTransport::new());
+        let pool = Arc::new(MessagePool::new(0)); // 空プールで開始
+        let proxy = SipProxy::new(
+            transport.clone(),
+            Arc::new(LocationService::new()),
+            None,
+            proxy_config(),
+            pool.clone(),
+        );
+
+        assert_eq!(pool.available(), 0, "初期状態でプールは空");
+        let response = make_200ok_response("call-pool-resp");
+        proxy.handle_response(response, uas_addr()).await.unwrap();
+
+        // 処理後にバッファが返却されていること
+        assert_eq!(pool.available(), 1, "処理後にバッファがプールに返却されるべき");
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+    }
+
+    /// handle_register がプール版フォーマッターを使用し、バッファを返却すること (Req 4.2, 4.3)
+    #[tokio::test]
+    async fn test_handle_register_uses_pool_and_returns_buf() {
+        let transport = Arc::new(MockTransport::new());
+        let pool = Arc::new(MessagePool::new(0)); // 空プールで開始
+        let proxy = SipProxy::new(
+            transport.clone(),
+            Arc::new(LocationService::new()),
+            None,
+            proxy_config(),
+            pool.clone(),
+        );
+
+        assert_eq!(pool.available(), 0, "初期状態でプールは空");
+        let register = make_register("call-pool-reg2");
+        proxy.handle_request(register, uac_addr()).await.unwrap();
+
+        // 処理後にバッファが返却されていること
+        assert_eq!(pool.available(), 1, "処理後にバッファがプールに返却されるべき");
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.status_code, 200);
+    }
+
+    /// 認証チャレンジ応答時もプールバッファが返却されること (Req 4.3)
+    #[tokio::test]
+    async fn test_auth_challenge_uses_pool_and_returns_buf() {
+        let transport = Arc::new(MockTransport::new());
+        let user_pool = make_user_pool();
+        let auth = crate::auth::ProxyAuth::new("example.com".to_string(), user_pool);
+        let pool = Arc::new(MessagePool::new(0)); // 空プールで開始
+        let proxy = SipProxy::new(
+            transport.clone(),
+            Arc::new(LocationService::new()),
+            Some(auth),
+            proxy_config(),
+            pool.clone(),
+        );
+
+        assert_eq!(pool.available(), 0, "初期状態でプールは空");
+        let invite = make_invite("call-pool-auth2");
+        proxy.handle_request(invite, uac_addr()).await.unwrap();
+
+        // 407応答後もバッファが返却されていること
+        assert_eq!(pool.available(), 1, "認証チャレンジ後もバッファが返却されるべき");
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.status_code, 407);
+    }
+
+    /// 404応答時もプールバッファが返却されること (Req 4.3)
+    #[tokio::test]
+    async fn test_not_found_response_uses_pool_and_returns_buf() {
+        let transport = Arc::new(MockTransport::new());
+        let pool = Arc::new(MessagePool::new(0)); // 空プールで開始
+        let proxy = SipProxy::new(
+            transport.clone(),
+            Arc::new(LocationService::new()),
+            None,
+            proxy_config(),
+            pool.clone(),
+        );
+
+        assert_eq!(pool.available(), 0, "初期状態でプールは空");
+        // ローカルドメイン宛だが未登録 → 404
+        let invite = make_invite_local_domain("call-pool-404");
+        proxy.handle_request(invite, uac_addr()).await.unwrap();
+
+        // 404応答後もバッファが返却されていること
+        assert_eq!(pool.available(), 1, "404応答後もバッファが返却されるべき");
+
+        let sent = transport.sent_responses();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.status_code, 404);
     }
 }

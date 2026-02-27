@@ -1,7 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use sip_load_test::sip::formatter::format_sip_message;
+use sip_load_test::sip::formatter::{format_sip_message, format_into_pooled};
 use sip_load_test::sip::message::Headers;
-use sip_load_test::sip::parser::parse_sip_message;
+use sip_load_test::sip::parser::{parse_sip_message, parse_sip_message_pooled};
+use sip_load_test::sip::pool::MessagePool;
 
 /// INVITE リクエストのサンプルメッセージ
 const INVITE_MSG: &[u8] = b"INVITE sip:bob@example.com SIP/2.0\r\n\
@@ -128,10 +129,66 @@ fn bench_headers_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_parse_sip_message_pooled(c: &mut Criterion) {
+    let pool = MessagePool::new(1);
+
+    let mut group = c.benchmark_group("parse_sip_message_pooled");
+
+    group.bench_function("parse_invite_pooled", |b| {
+        b.iter(|| {
+            let mut buf = pool.get();
+            let result = parse_sip_message_pooled(criterion::black_box(INVITE_MSG), &mut buf);
+            pool.put(buf);
+            result
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_format_sip_message_pooled(c: &mut Criterion) {
+    let invite = parse_sip_message(INVITE_MSG).expect("INVITE parse failed");
+    let pool = MessagePool::new(1);
+
+    let mut group = c.benchmark_group("format_sip_message_pooled");
+
+    group.bench_function("format_invite_pooled", |b| {
+        b.iter(|| {
+            let mut buf = pool.get();
+            format_into_pooled(&mut buf, criterion::black_box(&invite));
+            pool.put(buf);
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_parse_format_roundtrip_pooled(c: &mut Criterion) {
+    let pool = MessagePool::new(1);
+
+    let mut group = c.benchmark_group("parse_format_roundtrip_pooled");
+
+    group.bench_function("parse_format_roundtrip_pooled", |b| {
+        b.iter(|| {
+            let mut buf = pool.get();
+            let msg = parse_sip_message_pooled(criterion::black_box(INVITE_MSG), &mut buf)
+                .expect("parse failed");
+            format_into_pooled(&mut buf, &msg);
+            let _output = &buf.output;
+            pool.put(buf);
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_sip_message,
     bench_format_sip_message,
-    bench_headers_get
+    bench_headers_get,
+    bench_parse_sip_message_pooled,
+    bench_format_sip_message_pooled,
+    bench_parse_format_roundtrip_pooled
 );
 criterion_main!(benches);

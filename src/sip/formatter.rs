@@ -164,6 +164,13 @@ pub fn format_sip_message(msg: &SipMessage) -> Vec<u8> {
     buf
 }
 
+/// MessageBuf の出力バッファを使用して SIP メッセージをフォーマットする。
+/// buf.output をクリアしてからフォーマット結果を書き込む。
+pub fn format_into_pooled(buf: &mut super::pool::MessageBuf, msg: &SipMessage) {
+    buf.output.clear();
+    format_into(&mut buf.output, msg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +680,121 @@ mod tests {
         }
     }
 
+    // --- Unit tests: format_into_pooled ---
+
+    #[test]
+    fn test_format_into_pooled_invite_request() {
+        use crate::sip::pool::MessageBuf;
+
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec();
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060".to_string());
+        headers.add("From", "<sip:alice@example.com>;tag=1234".to_string());
+        headers.add("To", "<sip:bob@example.com>".to_string());
+        headers.add("Call-ID", "invite123@10.0.0.1".to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+
+        let msg = SipMessage::Request(SipRequest {
+            method: Method::Invite,
+            request_uri: "sip:bob@example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers,
+            body: Some(body),
+        });
+
+        let expected = format_sip_message(&msg);
+        let mut buf = MessageBuf::new();
+        format_into_pooled(&mut buf, &msg);
+        assert_eq!(buf.output, expected, "プール版INVITEフォーマットは既存版と等価であるべき");
+    }
+
+    #[test]
+    fn test_format_into_pooled_200_ok_response() {
+        use crate::sip::pool::MessageBuf;
+
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.1:5060".to_string());
+        headers.add("Call-ID", "abc123@10.0.0.1".to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+
+        let msg = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: None,
+        });
+
+        let expected = format_sip_message(&msg);
+        let mut buf = MessageBuf::new();
+        format_into_pooled(&mut buf, &msg);
+        assert_eq!(buf.output, expected, "プール版200 OKフォーマットは既存版と等価であるべき");
+    }
+
+    #[test]
+    fn test_format_into_pooled_response_with_body() {
+        use crate::sip::pool::MessageBuf;
+
+        let body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\ns=session\r\n".to_vec();
+        let mut headers = Headers::new();
+        headers.add("Via", "SIP/2.0/UDP 10.0.0.2:5060".to_string());
+        headers.add("CSeq", "1 INVITE".to_string());
+        headers.add("Content-Type", "application/sdp".to_string());
+
+        let msg = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 200,
+            reason_phrase: "OK".to_string(),
+            headers,
+            body: Some(body),
+        });
+
+        let expected = format_sip_message(&msg);
+        let mut buf = MessageBuf::new();
+        format_into_pooled(&mut buf, &msg);
+        assert_eq!(buf.output, expected, "プール版ボディ付きフォーマットは既存版と等価であるべき");
+    }
+
+    #[test]
+    fn test_format_into_pooled_reuses_output_buffer() {
+        use crate::sip::pool::MessageBuf;
+
+        let msg1 = SipMessage::Response(SipResponse {
+            version: "SIP/2.0".to_string(),
+            status_code: 100,
+            reason_phrase: "Trying".to_string(),
+            headers: Headers::new(),
+            body: None,
+        });
+
+        let msg2 = SipMessage::Request(SipRequest {
+            method: Method::Invite,
+            request_uri: "sip:bob@example.com".to_string(),
+            version: "SIP/2.0".to_string(),
+            headers: Headers::new(),
+            body: None,
+        });
+
+        let mut buf = MessageBuf::new();
+
+        // 1回目のフォーマット
+        format_into_pooled(&mut buf, &msg1);
+        let expected1 = format_sip_message(&msg1);
+        assert_eq!(buf.output, expected1, "1回目のフォーマット結果が正しいこと");
+        let capacity_after_first = buf.output.capacity();
+
+        // 2回目のフォーマット（buf.output が再利用される）
+        format_into_pooled(&mut buf, &msg2);
+        let expected2 = format_sip_message(&msg2);
+        assert_eq!(buf.output, expected2, "2回目のフォーマット結果が正しいこと");
+        assert!(
+            buf.output.capacity() >= capacity_after_first,
+            "2回連続フォーマットで capacity が維持されるべき (1回目: {}, 2回目: {})",
+            capacity_after_first,
+            buf.output.capacity()
+        );
+    }
+
     use crate::sip::message::generators::{arb_sip_message, arb_sip_request, arb_sip_response};
     use proptest::prelude::*;
 
@@ -784,6 +906,20 @@ mod tests {
             let mut buf = Vec::new();
             format_into(&mut buf, &msg);
             prop_assert_eq!(buf, expected, "format_into must produce byte-identical output to format_sip_message");
+        }
+
+        /// Feature: sip-message-pool, Property 6: プール版フォーマッターの機能的等価性
+        /// For any valid SipMessage, format_into_pooled(&mut buf, &msg) produces
+        /// byte-identical output to format_sip_message(&msg).
+        /// **Validates: Requirements 3.1, 3.2**
+        #[test]
+        fn prop_format_into_pooled_byte_identical(msg in arb_sip_message()) {
+            use crate::sip::pool::MessageBuf;
+
+            let expected = format_sip_message(&msg);
+            let mut buf = MessageBuf::new();
+            format_into_pooled(&mut buf, &msg);
+            prop_assert_eq!(buf.output, expected, "format_into_pooled must produce byte-identical output to format_sip_message");
         }
     }
 }

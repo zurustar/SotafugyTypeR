@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === SIP Load Tester — Performance Benchmark (with samply profiler) ===
+# === SIP Proxy — Performance Profiling (proxy side) ===
+# samply でプロキシ側をプロファイリングする
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -11,17 +12,23 @@ LOADTEST_BIN="$PROJECT_DIR/target/release/sip-load-test"
 
 PROXY_CFG="/tmp/bench_proxy.json"
 BENCH_CFG="/tmp/bench_config.json"
-RESULT_FILE="/tmp/bench_result.json"
-PROXY_LOG="/tmp/bench_proxy.log"
+RESULT_FILE="/tmp/bench_result_proxy_profile.json"
+PROXY_LOG="/tmp/bench_proxy_profile.log"
 USERS_FILE="/tmp/bench_users.json"
-PROFILE_FILE="/tmp/profile.json"
+PROFILE_FILE="/tmp/proxy_profile.json"
 
-PROXY_PID=""
+LOADTEST_PID=""
+SAMPLY_PID=""
 
 cleanup() {
-    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-        kill "$PROXY_PID" 2>/dev/null
-        wait "$PROXY_PID" 2>/dev/null || true
+    if [ -n "$LOADTEST_PID" ] && kill -0 "$LOADTEST_PID" 2>/dev/null; then
+        kill "$LOADTEST_PID" 2>/dev/null
+        wait "$LOADTEST_PID" 2>/dev/null || true
+    fi
+    # samply + proxy は samply 終了時に自動停止
+    if [ -n "$SAMPLY_PID" ] && kill -0 "$SAMPLY_PID" 2>/dev/null; then
+        kill "$SAMPLY_PID" 2>/dev/null
+        wait "$SAMPLY_PID" 2>/dev/null || true
     fi
     rm -f "$PROXY_CFG" "$BENCH_CFG" "$USERS_FILE"
     echo ""
@@ -29,8 +36,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 1. Release build with debug symbols ---
-echo "=== Building (release + debug symbols) ==="
+# --- 1. Release build ---
+echo "=== Building (release) ==="
 cd "$PROJECT_DIR"
 cargo build --release 2>&1
 echo ""
@@ -66,7 +73,7 @@ cat > "$BENCH_CFG" << 'EOF'
   "uas_host": "127.0.0.1",
   "uas_port": 5080,
   "uas_port_count": 4,
-  "target_cps": 500.0,
+  "target_cps": 1350.0,
   "duration": 30,
   "scenario": "invite_bye",
   "call_duration": 30,
@@ -74,64 +81,50 @@ cat > "$BENCH_CFG" << 'EOF'
   "auth_enabled": true,
   "users_file": "/tmp/bench_users.json",
   "session_expires": 10,
-  "mode": "binary_search",
-  "binary_search": {
-    "initial_cps": 10.0,
-    "step_size": 50.0,
-    "step_duration": 15,
-    "error_threshold": 0.01,
-    "convergence_threshold": 5.0,
-    "cooldown_duration": 2
-  }
+  "mode": "sustained"
 }
 EOF
 
-# --- 3. Start proxy ---
-echo "=== Starting SIP Proxy ==="
-"$PROXY_BIN" "$PROXY_CFG" > "$PROXY_LOG" 2>&1 &
-PROXY_PID=$!
-sleep 1
+# --- 3. Start proxy under samply profiler ---
+echo "=== Starting SIP Proxy under samply profiler ==="
+samply record --no-open --unstable-presymbolicate -o "$PROFILE_FILE" -- "$PROXY_BIN" "$PROXY_CFG" > "$PROXY_LOG" 2>&1 &
+SAMPLY_PID=$!
+sleep 2
 
-if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    echo "ERROR: Proxy failed to start. Log:"
-    cat "$PROXY_LOG"
-    exit 1
-fi
-echo "Proxy started (PID: $PROXY_PID)"
+echo "Proxy + samply started (PID: $SAMPLY_PID)"
 echo ""
 
-# --- 4. Run benchmark with samply profiler ---
-echo "=== Running Benchmark with samply profiler ==="
-samply record --save-only -o "$PROFILE_FILE" -- "$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
+# --- 4. Run fixed-rate benchmark at max stable CPS ---
+echo "=== Running fixed-rate benchmark at 1350 CPS for 30s ==="
+"$LOADTEST_BIN" run "$BENCH_CFG" --output "$RESULT_FILE" 2>&1
 echo ""
 
-echo "Profile saved: $PROFILE_FILE"
+# --- 5. Stop proxy (send SIGINT to samply, which forwards to proxy) ---
+echo "=== Stopping proxy ==="
+kill -INT "$SAMPLY_PID" 2>/dev/null || true
+wait "$SAMPLY_PID" 2>/dev/null || true
+SAMPLY_PID=""
+echo ""
+
+echo "Proxy profile saved: $PROFILE_FILE"
 echo "(Open with: samply load $PROFILE_FILE)"
 echo ""
 
-# --- 5. Show results ---
+# --- 6. Show results ---
 echo "=== Results ==="
 if [ -f "$RESULT_FILE" ]; then
     if command -v jq &>/dev/null; then
         jq '{
-            max_stable_cps: .max_stable_cps,
             total_calls: .total_calls,
             successful_calls: .successful_calls,
             failed_calls: .failed_calls,
-            auth_failures: .auth_failures,
+            error_rate: (if .total_calls > 0 then (.failed_calls / .total_calls) else 0 end),
             latency_p50_ms: .latency_p50_ms,
             latency_p90_ms: .latency_p90_ms,
             latency_p95_ms: .latency_p95_ms,
-            latency_p99_ms: .latency_p99_ms,
-            status_codes: .status_codes
+            latency_p99_ms: .latency_p99_ms
         }' "$RESULT_FILE"
     else
         cat "$RESULT_FILE"
     fi
-    echo ""
-    echo "Full result: $RESULT_FILE"
-    echo "Proxy log:   $PROXY_LOG"
-else
-    echo "ERROR: Result file not found at $RESULT_FILE"
-    exit 1
 fi

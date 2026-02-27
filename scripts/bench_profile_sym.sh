@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === SIP Load Tester — Performance Benchmark (with samply profiler) ===
+# シンボル解決付きプロファイル取得スクリプト
+# ロードテスター側をプロファイル、プロキシは通常起動
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -10,11 +11,11 @@ PROXY_BIN="$PROJECT_DIR/target/release/sip-proxy"
 LOADTEST_BIN="$PROJECT_DIR/target/release/sip-load-test"
 
 PROXY_CFG="/tmp/bench_proxy.json"
-BENCH_CFG="/tmp/bench_config.json"
-RESULT_FILE="/tmp/bench_result.json"
-PROXY_LOG="/tmp/bench_proxy.log"
+BENCH_CFG="/tmp/bench_config_profile.json"
+RESULT_FILE="/tmp/bench_result_sym.json"
+PROXY_LOG="/tmp/bench_proxy_sym.log"
 USERS_FILE="/tmp/bench_users.json"
-PROFILE_FILE="/tmp/profile.json"
+PROFILE_FILE="/tmp/profile_sym.json"
 
 PROXY_PID=""
 
@@ -24,18 +25,15 @@ cleanup() {
         wait "$PROXY_PID" 2>/dev/null || true
     fi
     rm -f "$PROXY_CFG" "$BENCH_CFG" "$USERS_FILE"
-    echo ""
     echo "Cleanup done."
 }
 trap cleanup EXIT
 
-# --- 1. Release build with debug symbols ---
-echo "=== Building (release + debug symbols) ==="
+echo "=== Building (release) ==="
 cd "$PROJECT_DIR"
 cargo build --release 2>&1
 echo ""
 
-# --- 2. Config files ---
 cat > "$USERS_FILE" << 'EOF'
 {
   "users": [
@@ -56,6 +54,7 @@ cat > "$PROXY_CFG" << 'EOF'
 }
 EOF
 
+# sustained モードで高負荷（max_stable_cps の 80% = 1350 CPS）を 20 秒間
 cat > "$BENCH_CFG" << 'EOF'
 {
   "proxy_host": "127.0.0.1",
@@ -66,27 +65,18 @@ cat > "$BENCH_CFG" << 'EOF'
   "uas_host": "127.0.0.1",
   "uas_port": 5080,
   "uas_port_count": 4,
-  "target_cps": 500.0,
-  "duration": 30,
+  "target_cps": 1350.0,
+  "duration": 20,
   "scenario": "invite_bye",
-  "call_duration": 30,
+  "call_duration": 20,
   "shutdown_timeout": 3,
   "auth_enabled": true,
   "users_file": "/tmp/bench_users.json",
   "session_expires": 10,
-  "mode": "binary_search",
-  "binary_search": {
-    "initial_cps": 10.0,
-    "step_size": 50.0,
-    "step_duration": 15,
-    "error_threshold": 0.01,
-    "convergence_threshold": 5.0,
-    "cooldown_duration": 2
-  }
+  "mode": "sustained"
 }
 EOF
 
-# --- 3. Start proxy ---
 echo "=== Starting SIP Proxy ==="
 "$PROXY_BIN" "$PROXY_CFG" > "$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
@@ -100,38 +90,24 @@ fi
 echo "Proxy started (PID: $PROXY_PID)"
 echo ""
 
-# --- 4. Run benchmark with samply profiler ---
-echo "=== Running Benchmark with samply profiler ==="
-samply record --save-only -o "$PROFILE_FILE" -- "$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
+echo "=== Running Benchmark with samply (symbolicated) ==="
+samply record --no-open --unstable-presymbolicate -o "$PROFILE_FILE" -- \
+    "$LOADTEST_BIN" run "$BENCH_CFG" --output "$RESULT_FILE" 2>&1
 echo ""
 
 echo "Profile saved: $PROFILE_FILE"
-echo "(Open with: samply load $PROFILE_FILE)"
-echo ""
 
-# --- 5. Show results ---
 echo "=== Results ==="
 if [ -f "$RESULT_FILE" ]; then
     if command -v jq &>/dev/null; then
         jq '{
-            max_stable_cps: .max_stable_cps,
             total_calls: .total_calls,
             successful_calls: .successful_calls,
             failed_calls: .failed_calls,
-            auth_failures: .auth_failures,
             latency_p50_ms: .latency_p50_ms,
-            latency_p90_ms: .latency_p90_ms,
-            latency_p95_ms: .latency_p95_ms,
-            latency_p99_ms: .latency_p99_ms,
-            status_codes: .status_codes
+            latency_p99_ms: .latency_p99_ms
         }' "$RESULT_FILE"
     else
         cat "$RESULT_FILE"
     fi
-    echo ""
-    echo "Full result: $RESULT_FILE"
-    echo "Proxy log:   $PROXY_LOG"
-else
-    echo "ERROR: Result file not found at $RESULT_FILE"
-    exit 1
 fi
