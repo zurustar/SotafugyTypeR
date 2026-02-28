@@ -23,6 +23,19 @@ pub struct StatsCollector {
     start_time: Instant,
 }
 
+/// 軽量スナップショット - カウンタ値とアクティブダイアログ数のみ返す
+#[derive(Debug, Clone)]
+pub struct LightSnapshot {
+    pub total_calls: u64,
+    pub successful_calls: u64,
+    pub failed_calls: u64,
+    pub active_dialogs: u64,
+    pub auth_failures: u64,
+    pub retransmissions: u64,
+    pub transaction_timeouts: u64,
+    pub cps: f64,
+}
+
 /// A point-in-time snapshot of collected statistics.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
@@ -160,6 +173,30 @@ impl StatsCollector {
             latency_p95: p95,
             latency_p99: p99,
             status_codes: status_map,
+        }
+    }
+
+    /// Take a lightweight snapshot of the current statistics.
+    /// Only reads atomic counters — no latency data copying or sorting.
+    pub fn snapshot_light(&self) -> LightSnapshot {
+        let now = Instant::now();
+        let total = self.total_calls.load(Ordering::Relaxed);
+        let elapsed = now.duration_since(self.start_time).as_secs_f64();
+        let cps = if elapsed > 0.0 {
+            total as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        LightSnapshot {
+            total_calls: total,
+            successful_calls: self.successful_calls.load(Ordering::Relaxed),
+            failed_calls: self.failed_calls.load(Ordering::Relaxed),
+            active_dialogs: self.active_dialogs.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            retransmissions: self.retransmissions.load(Ordering::Relaxed),
+            transaction_timeouts: self.transaction_timeouts.load(Ordering::Relaxed),
+            cps,
         }
     }
 
@@ -667,6 +704,63 @@ mod tests {
         assert_eq!(snap.transaction_timeouts, 500);
     }
 
+    #[test]
+    fn test_snapshot_light_empty_collector() {
+        let collector = StatsCollector::new();
+        let light = collector.snapshot_light();
+        assert_eq!(light.total_calls, 0);
+        assert_eq!(light.successful_calls, 0);
+        assert_eq!(light.failed_calls, 0);
+        assert_eq!(light.active_dialogs, 0);
+        assert_eq!(light.auth_failures, 0);
+        assert_eq!(light.retransmissions, 0);
+        assert_eq!(light.transaction_timeouts, 0);
+        assert!(light.cps >= 0.0);
+    }
+
+    #[test]
+    fn test_snapshot_light_after_single_operation() {
+        let collector = StatsCollector::new();
+        collector.record_call(200, Duration::from_millis(10));
+
+        let light = collector.snapshot_light();
+        assert_eq!(light.total_calls, 1);
+        assert_eq!(light.successful_calls, 1);
+        assert_eq!(light.failed_calls, 0);
+        assert!(light.cps >= 0.0);
+    }
+
+    #[test]
+    fn test_snapshot_light_after_multiple_operations() {
+        let collector = StatsCollector::new();
+
+        // Record various operations
+        collector.record_call(200, Duration::from_millis(10));
+        collector.record_call(200, Duration::from_millis(20));
+        collector.record_failure();
+        collector.record_auth_failure();
+        collector.record_auth_failure();
+        collector.increment_active_dialogs();
+        collector.increment_active_dialogs();
+        collector.increment_active_dialogs();
+        collector.decrement_active_dialogs();
+        collector.record_retransmission();
+        collector.record_retransmission();
+        collector.record_retransmission();
+        collector.record_transaction_timeout();
+
+        let light = collector.snapshot_light();
+        assert_eq!(light.total_calls, 3); // 2 success + 1 failure
+        assert_eq!(light.successful_calls, 2);
+        assert_eq!(light.failed_calls, 1);
+        assert_eq!(light.active_dialogs, 2); // 3 inc - 1 dec
+        assert_eq!(light.auth_failures, 2);
+        assert_eq!(light.retransmissions, 3);
+        assert_eq!(light.transaction_timeouts, 1);
+        assert!(light.cps >= 0.0);
+    }
+
+
 
 
 
@@ -814,6 +908,97 @@ mod tests {
             prop_assert_eq!(snap.total_calls, 0);
             prop_assert_eq!(snap.failed_calls, 0);
         }
+    }
+
+    // Feature: codebase-refactoring, Property 3: Lightweight snapshot counter consistency
+    // **Validates: Requirements 8.1, 8.4**
+    //
+    // StatsCollector に対する任意の操作列の後、snapshot_light() が返すカウンタ値が
+    // snapshot() の対応フィールドと等しいことを検証する。
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_snapshot_light_counter_consistency(
+            ops in vec(0u8..7, 0..200)
+        ) {
+            let collector = StatsCollector::new();
+
+            // Track increments to avoid underflow on decrement
+            let mut increments: u64 = 0;
+            let mut decrements: u64 = 0;
+
+            for &op in &ops {
+                match op {
+                    0 => collector.record_call(200, Duration::from_millis(1)),
+                    1 => collector.record_failure(),
+                    2 => collector.record_auth_failure(),
+                    3 => {
+                        collector.increment_active_dialogs();
+                        increments += 1;
+                    }
+                    4 => {
+                        // Only decrement if we have headroom to avoid u64 underflow
+                        if decrements < increments {
+                            collector.decrement_active_dialogs();
+                            decrements += 1;
+                        }
+                    }
+                    5 => collector.record_retransmission(),
+                    6 => collector.record_transaction_timeout(),
+                    _ => unreachable!(),
+                }
+            }
+
+            let light = collector.snapshot_light();
+            let full = collector.snapshot();
+
+            prop_assert_eq!(light.total_calls, full.total_calls,
+                "total_calls mismatch: light={}, full={}", light.total_calls, full.total_calls);
+            prop_assert_eq!(light.successful_calls, full.successful_calls,
+                "successful_calls mismatch: light={}, full={}", light.successful_calls, full.successful_calls);
+            prop_assert_eq!(light.failed_calls, full.failed_calls,
+                "failed_calls mismatch: light={}, full={}", light.failed_calls, full.failed_calls);
+            prop_assert_eq!(light.active_dialogs, full.active_dialogs,
+                "active_dialogs mismatch: light={}, full={}", light.active_dialogs, full.active_dialogs);
+            prop_assert_eq!(light.auth_failures, full.auth_failures,
+                "auth_failures mismatch: light={}, full={}", light.auth_failures, full.auth_failures);
+            prop_assert_eq!(light.retransmissions, full.retransmissions,
+                "retransmissions mismatch: light={}, full={}", light.retransmissions, full.retransmissions);
+            prop_assert_eq!(light.transaction_timeouts, full.transaction_timeouts,
+                "transaction_timeouts mismatch: light={}, full={}", light.transaction_timeouts, full.transaction_timeouts);
+        }
+    }
+
+    // Edge case: 操作なし（初期状態）での snapshot_light と snapshot の一致
+    #[test]
+    fn test_snapshot_light_consistency_empty() {
+        let collector = StatsCollector::new();
+        let light = collector.snapshot_light();
+        let full = collector.snapshot();
+
+        assert_eq!(light.total_calls, full.total_calls);
+        assert_eq!(light.successful_calls, full.successful_calls);
+        assert_eq!(light.failed_calls, full.failed_calls);
+        assert_eq!(light.active_dialogs, full.active_dialogs);
+        assert_eq!(light.auth_failures, full.auth_failures);
+        assert_eq!(light.retransmissions, full.retransmissions);
+        assert_eq!(light.transaction_timeouts, full.transaction_timeouts);
+    }
+
+    // Edge case: decrement_active_dialogs が increment より多い場合（アンダーフロー）
+    #[test]
+    fn test_snapshot_light_consistency_underflow_active_dialogs() {
+        let collector = StatsCollector::new();
+        collector.increment_active_dialogs();
+        collector.decrement_active_dialogs();
+        collector.decrement_active_dialogs(); // underflow: wraps around for u64
+
+        let light = collector.snapshot_light();
+        let full = collector.snapshot();
+
+        // Both should report the same (wrapped) value
+        assert_eq!(light.active_dialogs, full.active_dialogs);
     }
 
     // Feature: performance-profiling-optimization, Property 3: StatsCollectorのtotal_calls不変条件

@@ -91,7 +91,7 @@ echo "Proxy started (PID: $PROXY_PID)"
 echo ""
 
 echo "=== Running Benchmark with samply (symbolicated) ==="
-samply record --no-open --unstable-presymbolicate -o "$PROFILE_FILE" -- \
+samply record --save-only -o "$PROFILE_FILE" -- \
     "$LOADTEST_BIN" run "$BENCH_CFG" --output "$RESULT_FILE" 2>&1
 echo ""
 

@@ -36,6 +36,16 @@ graph TD
 
 ## 主要コンポーネント
 
+トランザクション層は以下のファイルに分割されています:
+- `transaction/mod.rs`: re-export、`TransactionId`、`Transaction` enum、`TransactionEvent`
+- `transaction/helpers.rs`: `extract_branch`, `parse_method_from_cseq`, `generate_ack`
+- `transaction/invite_client.rs`: `InviteClientState`, `InviteClientAction`, `InviteClientTransaction`
+- `transaction/non_invite_client.rs`: `NonInviteClientState`, `NonInviteClientAction`, `NonInviteClientTransaction`
+- `transaction/invite_server.rs`: `InviteServerState`, `InviteServerAction`, `InviteServerTransaction`
+- `transaction/non_invite_server.rs`: `NonInviteServerState`, `NonInviteServerAction`, `NonInviteServerTransaction`
+- `transaction/manager.rs`: `TransactionManager`
+- `transaction/timer.rs`: `TimerConfig`
+
 ### TransactionId
 
 Via headerのbranchパラメータとメソッドの組み合わせでトランザクションを一意に識別します。

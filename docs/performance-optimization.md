@@ -168,3 +168,42 @@ BYE送信を`tokio::time::interval`によるバッチ処理に変更。コール
 | max_stable_cps | 1,680 | 1,680 |
 
 ベースラインCPS（1,680）を維持しており、性能リグレッションなしを確認しました。
+
+## コードベースリファクタリング（第4フェーズ）
+
+### はじめに
+
+第3フェーズまでの最適化に続き、コードベース全体の保守性・可読性を改善するリファクタリングを実施しました。外部APIや動作の変更は行わず、内部構造の整理に焦点を当てています。
+
+### リファクタリング内容
+
+| 領域 | 変更内容 |
+|------|----------|
+| Method Display | `method_to_str` 関数（3箇所に重複）を `Method` の `Display` トレイト実装に統合 |
+| SipTransport 移動 | `SipTransport` トレイトを `uas/mod.rs` から `transport/mod.rs` に移動 |
+| MockTransport 共通化 | 5モジュールに重複していた `MockTransport` を `testutil/mod.rs` に統合 |
+| Transaction 分割 | 5,261行の `transaction/mod.rs` を7ファイルに分割（helpers, invite_client, non_invite_client, invite_server, non_invite_server, manager, timer） |
+| Proxy 分割 | 4,320行の `proxy/mod.rs` を5ファイルに分割（config, location, helpers, debug, mod） |
+| UAC 分割 | 4,042行の `uac/mod.rs` を4ファイルに分割（config, builders, load_pattern, mod） |
+| 未使用フィールド削除 | `Uas.config` フィールド、`Orchestrator.user_pool` フィールドを削除 |
+| 軽量スナップショット | `StatsCollector` に `snapshot_light()` メソッドを追加、ドレインループで使用 |
+| 未使用コード削除 | `src/transport/batch.rs`（`BatchMessageProcessor`）を削除 |
+
+### 正当性プロパティ
+
+以下のプロパティをproptestで検証済み:
+
+1. Method Display round-trip: `Display` でフォーマットした文字列を `parse_method` で再パースすると元の値と一致
+2. MockTransport message recording: 送信操作の記録数と内容が正確に一致
+3. Lightweight snapshot counter consistency: `snapshot_light()` のカウンタ値が `snapshot()` の対応フィールドと一致
+
+### ベンチマーク結果
+
+| 指標 | リファクタリング前 | リファクタリング後 |
+|------|-------------------|-------------------|
+| max_stable_cps | 1,680 | 1,680 |
+| BHCA換算 | 約6,048,000 | 約6,048,000 |
+| テスト数 | 1,188 | 1,188 |
+| コンパイラ警告 | 0 | 0 |
+
+リファクタリング後もパフォーマンスに変化なし。全1,188テストがパスし、コンパイラ警告ゼロを維持しています。

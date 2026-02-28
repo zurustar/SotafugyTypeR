@@ -1,20 +1,7 @@
 // SIP message formatter
 // Converts SipMessage structs into RFC 3261 compliant byte sequences
 
-use super::message::{Method, SipMessage};
-
-/// Convert a Method enum to its string representation
-fn method_to_str(method: &Method) -> &str {
-    match method {
-        Method::Register => "REGISTER",
-        Method::Invite => "INVITE",
-        Method::Ack => "ACK",
-        Method::Bye => "BYE",
-        Method::Options => "OPTIONS",
-        Method::Update => "UPDATE",
-        Method::Other(s) => s.as_str(),
-    }
-}
+use super::message::{SipMessage};
 
 /// Estimate the output size of a formatted SIP message to pre-allocate buffer.
 /// The estimate is intentionally slightly over to avoid re-allocation.
@@ -22,7 +9,7 @@ pub fn estimate_message_size(msg: &SipMessage) -> usize {
     match msg {
         SipMessage::Request(req) => {
             // Request line: METHOD SP URI SP VERSION CRLF
-            let mut size = method_to_str(&req.method).len() + 1
+            let mut size = req.method.to_string().len() + 1
                 + req.request_uri.len() + 1
                 + req.version.len() + 2;
             // Headers
@@ -68,7 +55,7 @@ pub fn format_into(buf: &mut Vec<u8>, msg: &SipMessage) {
     match msg {
         SipMessage::Request(req) => {
             // Request line
-            buf.extend_from_slice(method_to_str(&req.method).as_bytes());
+            buf.extend_from_slice(req.method.to_string().as_bytes());
             buf.push(b' ');
             buf.extend_from_slice(req.request_uri.as_bytes());
             buf.push(b' ');
@@ -174,44 +161,44 @@ pub fn format_into_pooled(buf: &mut super::pool::MessageBuf, msg: &SipMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::message::{Headers, SipRequest, SipResponse};
+    use crate::sip::message::{Headers, Method, SipRequest, SipResponse};
 
-    // --- Unit tests: Method to string conversion ---
+    // --- Unit tests: Method Display trait (replaces method_to_str tests) ---
 
     #[test]
-    fn test_method_to_str_register() {
-        assert_eq!(method_to_str(&Method::Register), "REGISTER");
+    fn test_method_display_register() {
+        assert_eq!(Method::Register.to_string(), "REGISTER");
     }
 
     #[test]
-    fn test_method_to_str_invite() {
-        assert_eq!(method_to_str(&Method::Invite), "INVITE");
+    fn test_method_display_invite() {
+        assert_eq!(Method::Invite.to_string(), "INVITE");
     }
 
     #[test]
-    fn test_method_to_str_ack() {
-        assert_eq!(method_to_str(&Method::Ack), "ACK");
+    fn test_method_display_ack() {
+        assert_eq!(Method::Ack.to_string(), "ACK");
     }
 
     #[test]
-    fn test_method_to_str_bye() {
-        assert_eq!(method_to_str(&Method::Bye), "BYE");
+    fn test_method_display_bye() {
+        assert_eq!(Method::Bye.to_string(), "BYE");
     }
 
     #[test]
-    fn test_method_to_str_options() {
-        assert_eq!(method_to_str(&Method::Options), "OPTIONS");
+    fn test_method_display_options() {
+        assert_eq!(Method::Options.to_string(), "OPTIONS");
     }
 
     #[test]
-    fn test_method_to_str_update() {
-        assert_eq!(method_to_str(&Method::Update), "UPDATE");
+    fn test_method_display_update() {
+        assert_eq!(Method::Update.to_string(), "UPDATE");
     }
 
     #[test]
-    fn test_method_to_str_other() {
+    fn test_method_display_other() {
         assert_eq!(
-            method_to_str(&Method::Other("SUBSCRIBE".to_string())),
+            Method::Other("SUBSCRIBE".to_string()).to_string(),
             "SUBSCRIBE"
         );
     }

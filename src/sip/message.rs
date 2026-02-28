@@ -14,6 +14,20 @@ pub enum Method {
     Other(String),
 }
 
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Method::Register => write!(f, "REGISTER"),
+            Method::Invite => write!(f, "INVITE"),
+            Method::Ack => write!(f, "ACK"),
+            Method::Bye => write!(f, "BYE"),
+            Method::Options => write!(f, "OPTIONS"),
+            Method::Update => write!(f, "UPDATE"),
+            Method::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 /// A single SIP header (name-value pair)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
@@ -401,6 +415,48 @@ mod tests {
     #[test]
     fn test_method_other_inequality() {
         assert_ne!(Method::Other("FOO".into()), Method::Other("BAR".into()));
+    }
+
+    // --- Unit tests: Method Display ---
+
+    #[test]
+    fn test_method_display_register() {
+        assert_eq!(Method::Register.to_string(), "REGISTER");
+    }
+
+    #[test]
+    fn test_method_display_invite() {
+        assert_eq!(Method::Invite.to_string(), "INVITE");
+    }
+
+    #[test]
+    fn test_method_display_ack() {
+        assert_eq!(Method::Ack.to_string(), "ACK");
+    }
+
+    #[test]
+    fn test_method_display_bye() {
+        assert_eq!(Method::Bye.to_string(), "BYE");
+    }
+
+    #[test]
+    fn test_method_display_options() {
+        assert_eq!(Method::Options.to_string(), "OPTIONS");
+    }
+
+    #[test]
+    fn test_method_display_update() {
+        assert_eq!(Method::Update.to_string(), "UPDATE");
+    }
+
+    #[test]
+    fn test_method_display_other() {
+        assert_eq!(Method::Other("SUBSCRIBE".to_string()).to_string(), "SUBSCRIBE");
+    }
+
+    #[test]
+    fn test_method_display_other_custom() {
+        assert_eq!(Method::Other("NOTIFY".to_string()).to_string(), "NOTIFY");
     }
 
     // --- Unit tests: Header ---
@@ -989,6 +1045,45 @@ mod tests {
                 cached_all.clone(), linear_all.clone(),
                 "get_all('Via') mismatch: cached={:?}, linear={:?}",
                 cached_all, linear_all
+            );
+        }
+    }
+
+    // --- Property test: Method Display round-trip (Property 1) ---
+
+    /// parse_method equivalent for round-trip testing (mirrors src/sip/parser.rs::parse_method)
+    fn parse_method(method_str: &str) -> Method {
+        match method_str {
+            "REGISTER" => Method::Register,
+            "INVITE" => Method::Invite,
+            "ACK" => Method::Ack,
+            "BYE" => Method::Bye,
+            "OPTIONS" => Method::Options,
+            "UPDATE" => Method::Update,
+            other => Method::Other(String::from(other)),
+        }
+    }
+
+    /// Strategy that extends arb_method() with edge cases for Other variant
+    fn arb_method_with_edge_cases() -> BoxedStrategy<Method> {
+        prop_oneof![
+            8 => arb_method(),
+            1 => Just(Method::Other("".to_string())),
+            1 => "[!-~]{1,20}".prop_map(Method::Other),
+        ].boxed()
+    }
+
+    // **Validates: Requirements 5.1, 5.4**
+    // Feature: codebase-refactoring, Property 1: Method Display round-trip
+    proptest! {
+        #[test]
+        fn prop_method_display_round_trip(method in arb_method_with_edge_cases()) {
+            let displayed = method.to_string();
+            let parsed = parse_method(&displayed);
+            prop_assert_eq!(
+                parsed.clone(), method.clone(),
+                "Round-trip failed: method={:?}, displayed='{}', parsed={:?}",
+                method, displayed, parsed
             );
         }
     }

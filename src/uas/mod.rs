@@ -13,26 +13,7 @@ use crate::error::SipLoadTestError;
 use crate::sip::message::{Headers, Method, SipMessage, SipRequest, SipResponse};
 use crate::sip::formatter::format_sip_message;
 use crate::stats::StatsCollector;
-
-/// Transport trait to abstract UDP sending for testability.
-pub trait SipTransport: Send + Sync {
-    fn send_to<'a>(
-        &'a self,
-        data: &'a [u8],
-        addr: SocketAddr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>>;
-}
-
-/// Real UDP transport adapter
-impl SipTransport for crate::transport::UdpTransport {
-    fn send_to<'a>(
-        &'a self,
-        data: &'a [u8],
-        addr: SocketAddr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>> {
-        Box::pin(self.send_to(data, addr))
-    }
-}
+use crate::transport::SipTransport;
 
 /// UAS dialog state
 #[derive(Debug, Clone, PartialEq)]
@@ -51,24 +32,11 @@ pub struct UasDialog {
     pub last_activity: Instant,
 }
 
-/// UAS configuration
-#[derive(Debug, Clone)]
-pub struct UasConfig {
-    // Placeholder for future config fields (e.g., session timer settings)
-}
-
-impl Default for UasConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
 /// UAS (User Agent Server) - handles incoming SIP requests.
 pub struct Uas {
     transport: Arc<dyn SipTransport>,
     dialogs: DashMap<String, UasDialog>,
     stats: Arc<StatsCollector>,
-    config: UasConfig,
     transaction_manager: Option<crate::transaction::TransactionManager>,
 }
 
@@ -77,13 +45,11 @@ impl Uas {
     pub fn new(
         transport: Arc<dyn SipTransport>,
         stats: Arc<StatsCollector>,
-        config: UasConfig,
     ) -> Self {
         Self {
             transport,
             dialogs: DashMap::new(),
             stats,
-            config,
             transaction_manager: None,
         }
     }
@@ -92,14 +58,12 @@ impl Uas {
     pub fn with_transaction_manager(
         transport: Arc<dyn SipTransport>,
         stats: Arc<StatsCollector>,
-        config: UasConfig,
         transaction_manager: crate::transaction::TransactionManager,
     ) -> Self {
         Self {
             transport,
             dialogs: DashMap::new(),
             stats,
-            config,
             transaction_manager: Some(transaction_manager),
         }
     }
@@ -493,37 +457,18 @@ impl Uas {
 mod tests {
     use super::*;
     use crate::sip::message::{Headers, Method, SipMessage, SipRequest};
-    use crate::sip::parser::parse_sip_message;
     use crate::stats::StatsCollector;
+    use crate::testutil::MockTransport;
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    /// Mock transport that records all sent messages for verification.
-    struct MockTransport {
-        sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    /// uas 用の MockTransport ヘルパーメソッド拡張
+    trait MockTransportUasExt {
+        fn sent_responses(&self) -> Vec<crate::sip::message::SipResponse>;
     }
 
-    impl MockTransport {
-        fn new() -> Self {
-            Self {
-                sent: Mutex::new(Vec::new()),
-            }
-        }
-
-        /// Get all sent messages, parsed as SipMessages.
-        fn sent_messages(&self) -> Vec<(SipMessage, SocketAddr)> {
-            self.sent
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(data, addr)| {
-                    parse_sip_message(data).ok().map(|msg| (msg, *addr))
-                })
-                .collect()
-        }
-
-        /// Get sent responses only.
+    impl MockTransportUasExt for MockTransport {
         fn sent_responses(&self) -> Vec<crate::sip::message::SipResponse> {
             self.sent_messages()
                 .into_iter()
@@ -535,19 +480,6 @@ mod tests {
         }
     }
 
-    impl SipTransport for MockTransport {
-        fn send_to<'a>(
-            &'a self,
-            data: &'a [u8],
-            addr: SocketAddr,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>,
-        > {
-            self.sent.lock().unwrap().push((data.to_vec(), addr));
-            Box::pin(async { Ok(()) })
-        }
-    }
-
     fn test_addr() -> SocketAddr {
         "127.0.0.1:5060".parse().unwrap()
     }
@@ -556,7 +488,6 @@ mod tests {
         Uas::new(
             transport,
             Arc::new(StatsCollector::new()),
-            UasConfig::default(),
         )
     }
 
@@ -677,7 +608,7 @@ mod tests {
     async fn test_invite_increments_active_dialogs() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
 
         let invite = make_invite_request("call-stats");
         uas.handle_request(invite, test_addr()).await.unwrap();
@@ -777,7 +708,7 @@ mod tests {
     async fn test_bye_existing_dialog_decrements_active_dialogs() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
 
         let invite = make_invite_request("call-bye-stats");
         uas.handle_request(invite, test_addr()).await.unwrap();
@@ -864,7 +795,7 @@ mod tests {
     async fn test_full_invite_ack_bye_flow() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
         let addr = test_addr();
 
         // INVITE
@@ -933,7 +864,7 @@ mod tests {
     async fn test_multiple_concurrent_dialogs() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
         let addr = test_addr();
 
         // Create 3 dialogs
@@ -1159,7 +1090,7 @@ mod tests {
     async fn test_check_session_timeouts_removes_expired_dialogs() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
         let addr = test_addr();
 
         // Create dialog with very short session expiry
@@ -1184,7 +1115,7 @@ mod tests {
     async fn test_check_session_timeouts_records_failure_in_stats() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
         let addr = test_addr();
 
         // Create dialog with very short session expiry
@@ -1207,7 +1138,7 @@ mod tests {
     async fn test_check_session_timeouts_does_not_remove_active_dialogs() {
         let transport = Arc::new(MockTransport::new());
         let stats = Arc::new(StatsCollector::new());
-        let uas = Uas::new(transport.clone(), stats.clone(), UasConfig::default());
+        let uas = Uas::new(transport.clone(), stats.clone());
         let addr = test_addr();
 
         // Create dialog with long session expiry
@@ -1257,7 +1188,6 @@ mod tests {
         let uas = Uas::with_transaction_manager(
             transport,
             stats.clone(),
-            UasConfig::default(),
             tm,
         );
         (uas, stats)

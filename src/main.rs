@@ -6,9 +6,9 @@ use sip_load_test::dialog::DialogManager;
 use sip_load_test::orchestrator::Orchestrator;
 use sip_load_test::reporter;
 use sip_load_test::sip::parser::parse_sip_message;
-use sip_load_test::transport::UdpTransport;
+use sip_load_test::transport::{SipTransport, UdpTransport};
 use sip_load_test::uac::{Uac, UacConfig};
-use sip_load_test::uas::{Uas, SipTransport, UasConfig};
+use sip_load_test::uas::Uas;
 use sip_load_test::user_pool::UserPool;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +76,7 @@ async fn run_load_test(
         Arc::new(UserPool::from_users_file(default_users)?)
     };
 
-    let mut orchestrator = Orchestrator::new(cfg.clone(), user_pool.clone());
+    let mut orchestrator = Orchestrator::new(cfg.clone());
     orchestrator.setup_signal_handler()?;
 
     // --- Set up transport, UAC, UAS ---
@@ -147,7 +147,6 @@ async fn run_load_test(
     let uas = Arc::new(Uas::new(
         uas_transport.clone() as Arc<dyn SipTransport>,
         stats.clone(),
-        UasConfig::default(),
     ));
     orchestrator.set_uas(uas.clone());
 

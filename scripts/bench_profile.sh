@@ -102,7 +102,7 @@ echo ""
 
 # --- 4. Run benchmark with samply profiler ---
 echo "=== Running Benchmark with samply profiler ==="
-samply record --save-only -o "$PROFILE_FILE" -- "$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
+samply record --save-only --unstable-presymbolicate -o "$PROFILE_FILE" -- "$LOADTEST_BIN" run "$BENCH_CFG" --mode binary-search --output "$RESULT_FILE" 2>&1
 echo ""
 
 echo "Profile saved: $PROFILE_FILE"

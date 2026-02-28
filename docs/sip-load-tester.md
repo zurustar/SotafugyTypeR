@@ -440,7 +440,7 @@ sequenceDiagram
 
 #### 1. SIPパーサ/フォーマッタ (`sip::parser`, `sip::formatter`)
 
-SIPメッセージのバイト列と構造化データ間の変換を担当する。ゼロコピーパースを実装し、頻出ヘッダのインデックスキャッシュにより定数時間アクセスを実現。
+SIPメッセージのバイト列と構造化データ間の変換を担当する。ゼロコピーパースを実装し、頻出ヘッダのインデックスキャッシュにより定数時間アクセスを実現。`Method` 列挙型は `Display` トレイトを実装しており、`method.to_string()` で文字列表現を取得できる（従来の `method_to_str` 関数は削除済み）。
 
 ```rust
 pub fn parse_sip_message(input: &[u8]) -> Result<SipMessage, ParseError>;
@@ -450,9 +450,18 @@ pub fn format_into(msg: &SipMessage, buf: &mut Vec<u8>);  // 事前確保バッ�
 
 #### 2. UDPトランスポート (`transport`)
 
-複数UDPソケットの管理と、受信パケットのディスパッチを担当する。Tokioの`UdpSocket`を使用し、ラウンドロビンによる送信分散を実装。
+複数UDPソケットの管理と、受信パケットのディスパッチを担当する。Tokioの`UdpSocket`を使用し、ラウンドロビンによる送信分散を実装。`SipTransport` トレイトもこのモジュールで定義する。
 
 ```rust
+/// トランスポート抽象化トレイト（UAC/UAS/プロキシが共通で使用）
+pub trait SipTransport: Send + Sync {
+    fn send_to<'a>(
+        &'a self,
+        data: &'a [u8],
+        addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SipLoadTestError>> + Send + 'a>>;
+}
+
 pub struct UdpTransport {
     sockets: Vec<Arc<UdpSocket>>,
     send_idx: AtomicUsize,  // ラウンドロビン用カウンタ
@@ -503,7 +512,13 @@ pub enum DialogState {
 
 #### 4. UAC (`uac`)
 
-SIPリクエストの生成・送信、レスポンスのハンドリングを担当する。各REGISTER/INVITEで`UserPool`からユーザをラウンドロビンまたはランダムに選択する。`build_invite_request`はSession-Expiresヘッダを付与する。
+SIPリクエストの生成・送信、レスポンスのハンドリングを担当する。モジュールは以下のファイルに分割されている:
+- `uac/mod.rs`: `Uac` 構造体と re-export
+- `uac/config.rs`: `UacConfig`, `BgRegisterResult`
+- `uac/builders.rs`: `build_via_value`, `build_from_value`, `build_to_value` 等のヘルパー関数
+- `uac/load_pattern.rs`: 負荷パターン定義
+
+各REGISTER/INVITEで`UserPool`からユーザをラウンドロビンまたはランダムに選択する。`build_invite_request`はSession-Expiresヘッダを付与する。
 
 ```rust
 pub struct Uac {
@@ -538,7 +553,6 @@ pub struct Uas {
     transport: Arc<UdpTransport>,
     dialogs: DashMap<String, UasDialog>,
     stats: Arc<StatsCollector>,
-    config: UasConfig,
 }
 
 impl Uas {
@@ -550,7 +564,14 @@ impl Uas {
 
 #### 6. テスト用SIPプロキシ (`proxy`)
 
-独立バイナリ（`sip-proxy`）として動作するStateless Proxy。詳細な設計は [プロキシプロセス分離](proxy-process-separation.md)、[プロキシデバッグログ](proxy-debug-logging.md)、[プロキシ複数ソケット・rport対応](proxy-multi-socket-rport.md) を参照。
+独立バイナリ（`sip-proxy`）として動作するStateless Proxy。モジュールは以下のファイルに分割されている:
+- `proxy/mod.rs`: `SipProxy` 構造体と re-export
+- `proxy/config.rs`: `ProxyConfig`
+- `proxy/location.rs`: `ContactInfo`, `LocationService`
+- `proxy/helpers.rs`: `parse_uri_addr`, `parse_via_addr`, `rand_branch`, `extract_uri`
+- `proxy/debug.rs`: `DebugEvent`, `format_*_log` 関数群
+
+詳細な設計は [プロキシプロセス分離](proxy-process-separation.md)、[プロキシデバッグログ](proxy-debug-logging.md)、[プロキシ複数ソケット・rport対応](proxy-multi-socket-rport.md) を参照。
 
 ```rust
 pub struct SipProxy {
@@ -560,6 +581,7 @@ pub struct SipProxy {
     config: ProxyConfig,
 }
 
+// proxy/config.rs
 pub struct ProxyConfig {
     pub host: String,
     pub port: u16,
@@ -568,6 +590,7 @@ pub struct ProxyConfig {
     pub debug: bool,
 }
 
+// proxy/location.rs
 pub struct LocationService {
     registrations: DashMap<String, ContactInfo>,
 }
@@ -665,7 +688,7 @@ impl UserGenerator {
 
 #### 9. 統計コレクタ (`stats`)
 
-CPUコア数ベースのシャーディングバッファで統計を収集する。パーセンタイル計算時に全シャードをマージする。
+CPUコア数ベースのシャーディングバッファで統計を収集する。パーセンタイル計算時に全シャードをマージする。ドレインループ等でレイテンシデータが不要な場合は `snapshot_light()` で軽量にカウンタ値のみ取得できる。
 
 ```rust
 pub struct StatsCollector {
@@ -696,6 +719,18 @@ pub struct StatsSnapshot {
     pub latency_p99: Duration,
     pub status_codes: HashMap<u16, u64>,
 }
+
+/// 軽量スナップショット - カウンタ値のみ返す（レイテンシデータのコピー・ソートなし）
+pub struct LightSnapshot {
+    pub total_calls: u64,
+    pub successful_calls: u64,
+    pub failed_calls: u64,
+    pub active_dialogs: u64,
+    pub auth_failures: u64,
+    pub retransmissions: u64,
+    pub transaction_timeouts: u64,
+    pub cps: f64,
+}
 ```
 
 #### 10. 実験オーケストレータ (`orchestrator`)
@@ -711,7 +746,6 @@ pub enum RunMode {
 
 pub struct Orchestrator {
     config: Config,
-    user_pool: Arc<UserPool>,
     uac: Option<Arc<Uac>>,
     uas: Option<Arc<Uas>>,
     stats: Arc<StatsCollector>,
@@ -855,6 +889,22 @@ pub struct ComparisonReport {
 }
 ```
 
+#### 14. テストユーティリティ (`testutil`)
+
+テスト専用の共通モジュール。`lib.rs` で `#[cfg(test)] pub mod testutil;` として宣言されており、プロダクションバイナリには含まれない。全モジュールで共有する `MockTransport` を提供する。
+
+```rust
+pub struct MockTransport {
+    pub sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    pub send_count: AtomicUsize,
+    pub should_fail: AtomicBool,
+}
+
+impl SipTransport for MockTransport {
+    // メッセージ記録、送信カウント、オプションの失敗注入
+}
+```
+
 ### データモデル
 
 #### SIPメッセージ構造
@@ -883,6 +933,11 @@ pub struct SipResponse {
 
 pub enum Method {
     Register, Invite, Ack, Bye, Options, Update, Other(String),
+}
+
+impl std::fmt::Display for Method {
+    // Register→"REGISTER", Invite→"INVITE", Ack→"ACK", Bye→"BYE",
+    // Options→"OPTIONS", Update→"UPDATE", Other(s)→s
 }
 
 pub struct Headers {

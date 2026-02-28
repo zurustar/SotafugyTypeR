@@ -1,24 +1,9 @@
 use sip_load_test::dialog::DialogManager;
-use sip_load_test::sip::message::SipMessage;
-use sip_load_test::sip::parser::parse_sip_message;
 use sip_load_test::stats::StatsCollector;
 use sip_load_test::transport::UdpTransport;
-use sip_load_test::uac::{Uac, UacConfig};
-use sip_load_test::uas::{SipTransport, Uas, UasConfig};
 use sip_load_test::user_pool::{UserEntry, UserPool, UsersFile};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-async fn wait_for_shutdown(flag: &AtomicBool) {
-    loop {
-        if flag.load(Ordering::Relaxed) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
 
 #[tokio::test]
 async fn test_single_invite_call_completes() {

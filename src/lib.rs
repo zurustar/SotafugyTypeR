@@ -14,3 +14,7 @@ pub mod reporter;
 pub mod user_pool;
 pub mod cli;
 pub mod benchmark;
+
+#[cfg(test)]
+pub mod testutil;
+

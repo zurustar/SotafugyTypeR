@@ -17,10 +17,10 @@ use crate::reporter::StepReport;
 use crate::sip::formatter::format_sip_message;
 use crate::sip::message::{Headers, Method, SipMessage, SipRequest};
 use crate::stats::{StatsCollector, StatsSnapshot};
+use crate::transport::SipTransport;
 use crate::uac::load_pattern::LoadPattern;
 use crate::uac::Uac;
-use crate::uas::{SipTransport, Uas};
-use crate::user_pool::UserPool;
+use crate::uas::Uas;
 
 /// Result of a single step execution.
 #[derive(Debug, Clone)]
@@ -33,7 +33,6 @@ pub struct StepResult {
 /// Experiment orchestrator - manages component lifecycle and experiment execution.
 pub struct Orchestrator {
     config: Config,
-    user_pool: Arc<UserPool>,
     uac: Option<Arc<Uac>>,
     uas: Option<Arc<Uas>>,
     stats: Arc<StatsCollector>,
@@ -43,10 +42,9 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Create a new Orchestrator instance.
-    pub fn new(config: Config, user_pool: Arc<UserPool>) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             config,
-            user_pool,
             uac: None,
             uas: None,
             stats: Arc::new(StatsCollector::new()),
@@ -415,7 +413,7 @@ impl Orchestrator {
         // Use call_duration + dialog_timeout as max drain time
         let drain_timeout = Duration::from_secs(self.config.call_duration) + Duration::from_secs(self.config.shutdown_timeout);
         let drain_start = Instant::now();
-        while self.stats.snapshot().active_dialogs > 0
+        while self.stats.snapshot_light().active_dialogs > 0
             && drain_start.elapsed() < drain_timeout
             && !self.shutdown_flag.load(Ordering::Relaxed)
         {
@@ -423,7 +421,7 @@ impl Orchestrator {
         }
 
         // Force cleanup remaining dialogs on timeout (Requirements: 3.4, 8.1)
-        if self.stats.snapshot().active_dialogs > 0 {
+        if self.stats.snapshot_light().active_dialogs > 0 {
             self.force_cleanup_remaining_dialogs();
         }
 
@@ -753,70 +751,15 @@ mod tests {
     use super::*;
     use crate::config::{Config, RunMode};
     use crate::dialog::DialogManager;
-    use crate::sip::message::{SipMessage, SipResponse};
-    use crate::sip::parser::parse_sip_message;
+    use crate::sip::message::SipMessage;
     use crate::stats::StatsCollector;
-    use crate::uas::SipTransport;
+    use crate::transport::SipTransport;
     use crate::uac::{Uac, UacConfig};
-    use crate::uas::{Uas, UasConfig};
+    use crate::uas::Uas;
     use crate::user_pool::{UserPool, UsersFile, UserEntry};
+    use crate::testutil::MockTransport;
     use std::net::SocketAddr;
     use std::pin::Pin;
-    use std::sync::Mutex;
-
-    // ===== Mock Transport =====
-
-    struct MockTransport {
-        sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
-        should_fail: AtomicBool,
-    }
-
-    impl MockTransport {
-        fn new() -> Self {
-            Self {
-                sent: Mutex::new(Vec::new()),
-                should_fail: AtomicBool::new(false),
-            }
-        }
-
-        fn set_should_fail(&self, fail: bool) {
-            self.should_fail.store(fail, Ordering::Relaxed);
-        }
-
-        fn sent_count(&self) -> usize {
-            self.sent.lock().unwrap().len()
-        }
-
-        fn sent_messages(&self) -> Vec<(SipMessage, SocketAddr)> {
-            self.sent
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(data, addr)| {
-                    parse_sip_message(data).ok().map(|msg| (msg, *addr))
-                })
-                .collect()
-        }
-    }
-
-    impl SipTransport for MockTransport {
-        fn send_to<'a>(
-            &'a self,
-            data: &'a [u8],
-            addr: SocketAddr,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>>
-        {
-            Box::pin(async move {
-                if self.should_fail.load(Ordering::Relaxed) {
-                    return Err(SipLoadTestError::NetworkError(
-                        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "mock failure"),
-                    ));
-                }
-                self.sent.lock().unwrap().push((data.to_vec(), addr));
-                Ok(())
-            })
-        }
-    }
 
     // ===== Test Helpers =====
 
@@ -908,8 +851,7 @@ mod tests {
 
     fn make_orchestrator(mode: RunMode) -> Orchestrator {
         let config = make_config(mode);
-        let pool = make_user_pool();
-        Orchestrator::new(config, pool)
+        Orchestrator::new(config)
     }
 
     fn make_uac(transport: Arc<dyn SipTransport>, stats: Arc<StatsCollector>, pool: Arc<UserPool>) -> Uac {
@@ -919,7 +861,7 @@ mod tests {
     }
 
     fn make_uas(transport: Arc<dyn SipTransport>, stats: Arc<StatsCollector>) -> Uas {
-        Uas::new(transport, stats, UasConfig::default())
+        Uas::new(transport, stats)
     }
 
     /// Attach a mock UAC to the orchestrator so that run_step actually sends calls
@@ -1281,7 +1223,7 @@ mod tests {
         config.duration = 1;
         config.target_cps = 10.0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         let transport = Arc::new(MockTransport::new());
         let uac = Arc::new(make_uac(
@@ -1303,7 +1245,7 @@ mod tests {
         config.duration = 60; // long duration
         config.target_cps = 100.0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         let transport = Arc::new(MockTransport::new());
         let uac = Arc::new(make_uac(
@@ -1424,8 +1366,7 @@ mod tests {
 
     fn make_step_up_orchestrator(initial_cps: f64, max_cps: f64, step_size: f64, error_threshold: f64) -> Orchestrator {
         let config = make_step_up_config(initial_cps, max_cps, step_size, error_threshold);
-        let pool = make_user_pool();
-        Orchestrator::new(config, pool)
+        Orchestrator::new(config)
     }
 
     /// Req 7.1: step_up config is required; returns error without it
@@ -1433,8 +1374,7 @@ mod tests {
     async fn test_run_step_up_requires_step_up_config() {
         let mut config = make_config(RunMode::StepUp);
         config.step_up = None; // no step_up config
-        let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool);
+        let mut orch = Orchestrator::new(config);
 
         let result = orch.run_step_up().await;
         assert!(result.is_err());
@@ -1605,8 +1545,7 @@ mod tests {
             convergence_threshold,
             cooldown_duration,
         );
-        let pool = make_user_pool();
-        Orchestrator::new(config, pool)
+        Orchestrator::new(config)
     }
 
     /// Req 8.1: binary_search config is required; returns error without it
@@ -1614,8 +1553,7 @@ mod tests {
     async fn test_run_binary_search_requires_config() {
         let mut config = make_config(RunMode::BinarySearch);
         config.binary_search = None;
-        let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool);
+        let mut orch = Orchestrator::new(config);
 
         let result = orch.run_binary_search().await;
         assert!(result.is_err());
@@ -2340,7 +2278,7 @@ mod tests {
         config.call_duration = 0;
         config.shutdown_timeout = 0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
         let dm = Arc::new(DialogManager::new(10_000));
         let transport: Arc<dyn SipTransport> = Arc::new(MockTransport::new());
         let uac = Uac::new(transport, dm.clone(), orch.stats().clone(), pool, UacConfig::default());
@@ -2391,8 +2329,7 @@ mod tests {
     #[test]
     fn test_force_cleanup_without_uac_is_noop() {
         let config = make_config(RunMode::Sustained);
-        let pool = make_user_pool();
-        let orch = Orchestrator::new(config, pool);
+        let orch = Orchestrator::new(config);
         // No UAC set - should not panic
         orch.force_cleanup_remaining_dialogs();
         assert_eq!(orch.stats().snapshot().failed_calls, 0);
@@ -2443,7 +2380,7 @@ mod tests {
         config.call_duration = 0;
         config.shutdown_timeout = 0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::new(orch.stats().clone()));
         let uac = make_uac(transport, orch.stats().clone(), pool);
@@ -2467,7 +2404,7 @@ mod tests {
         config.call_duration = 0;
         config.shutdown_timeout = 0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         // First 5 calls succeed, rest fail
         let transport: Arc<dyn SipTransport> = Arc::new(
@@ -2495,7 +2432,7 @@ mod tests {
         config.call_duration = 0;
         config.shutdown_timeout = 0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         let transport: Arc<dyn SipTransport> = Arc::new(StatsRecordingTransport::new(orch.stats().clone()));
         let uac = make_uac(transport, orch.stats().clone(), pool);
@@ -2520,7 +2457,7 @@ mod tests {
         config.call_duration = 0;
         config.shutdown_timeout = 0;
         let pool = make_user_pool();
-        let mut orch = Orchestrator::new(config, pool.clone());
+        let mut orch = Orchestrator::new(config);
 
         // First 5 calls succeed, rest fail
         let transport: Arc<dyn SipTransport> = Arc::new(

@@ -135,7 +135,7 @@ async fn main() {
     // UdpTransport を Arc で共有（recv_from 用と SipTransport 用）
     let transport = Arc::new(transport);
     let transport_for_recv = transport.clone();
-    let transport_arc: Arc<dyn sip_load_test::uas::SipTransport> = transport;
+    let transport_arc: Arc<dyn sip_load_test::transport::SipTransport> = transport;
 
     // LocationService の初期化
     let location_service = Arc::new(LocationService::new());
@@ -254,7 +254,7 @@ mod tests {
 
     use sip_load_test::proxy::LocationService;
     use sip_load_test::sip::pool::MessagePool;
-    use sip_load_test::uas::SipTransport;
+    use sip_load_test::transport::SipTransport;
     use std::net::SocketAddr;
 
     /// テスト用のモックトランスポート（recv_loop テスト用）

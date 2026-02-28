@@ -12,60 +12,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dashmap::DashMap;
+mod config;
+mod debug;
+mod helpers;
+mod location;
+
+pub use config::*;
+pub use location::*;
+
+use debug::*;
+use helpers::{extract_uri, parse_uri_addr, parse_via_addr, rand_branch};
 
 use crate::auth::ProxyAuth;
 use crate::error::SipLoadTestError;
 use crate::sip::formatter::format_into_pooled;
 use crate::sip::message::{Headers, Method, SipMessage, SipRequest, SipResponse};
 use crate::sip::pool::MessagePool;
-use crate::uas::SipTransport;
-
-/// Contact information stored in the Location Service.
-#[derive(Debug, Clone)]
-pub struct ContactInfo {
-    pub contact_uri: String,
-    pub address: SocketAddr,
-    pub expires: Instant,
-}
-
-/// In-memory Location Service for REGISTER/INVITE routing.
-/// Maps AOR (Address of Record) to ContactInfo.
-pub struct LocationService {
-    registrations: DashMap<String, ContactInfo>,
-}
-
-impl LocationService {
-    /// Create a new empty LocationService.
-    pub fn new() -> Self {
-        Self {
-            registrations: DashMap::new(),
-        }
-    }
-
-    /// Register a contact for the given AOR.
-    pub fn register(&self, aor: &str, contact: ContactInfo) {
-        self.registrations.insert(aor.to_string(), contact);
-    }
-
-    /// Lookup a contact by AOR. Returns None if not registered.
-    pub fn lookup(&self, aor: &str) -> Option<ContactInfo> {
-        self.registrations.get(aor).map(|entry| entry.clone())
-    }
-}
-
-/// Proxy configuration
-#[derive(Debug, Clone)]
-pub struct ProxyConfig {
-    pub host: String,
-    pub port: u16,
-    /// Default forwarding destination (UAS address)
-    pub forward_addr: SocketAddr,
-    /// Managed domain: Request-URIs targeting this domain use LocationService
-    pub domain: String,
-    /// Enable debug logging to stderr
-    pub debug: bool,
-}
+use crate::transport::SipTransport;
 
 /// Stateless SIP Proxy
 pub struct SipProxy {
@@ -114,10 +77,10 @@ impl SipProxy {
         match request {
             SipMessage::Request(req) => {
                 if self.config.debug {
-                    let method = method_to_str(&req.method);
+                    let method = req.method.to_string();
                     let uri = &req.request_uri;
                     let call_id = req.headers.get("Call-ID").unwrap_or("<unknown>");
-                    eprintln!("{}", format_recv_req_log(method, uri, from, call_id));
+                    eprintln!("{}", format_recv_req_log(&method, uri, from, call_id));
                 }
 
                 if req.method == Method::Register {
@@ -276,8 +239,8 @@ impl SipProxy {
                         let dest = contact.address;
                         if self.config.debug {
                             let call_id = request.headers.get("Call-ID").unwrap_or("<unknown>");
-                            let method = method_to_str(&request.method);
-                            eprintln!("{}", format_fwd_req_log(method, call_id, dest));
+                            let method = request.method.to_string();
+                            eprintln!("{}", format_fwd_req_log(&method, call_id, dest));
                         }
 
                         let mut buf = self.pool.get();
@@ -320,8 +283,8 @@ impl SipProxy {
 
         if self.config.debug {
             let call_id = request.headers.get("Call-ID").unwrap_or("<unknown>");
-            let method = method_to_str(&request.method);
-            eprintln!("{}", format_fwd_req_log(method, call_id, dest));
+            let method = request.method.to_string();
+            eprintln!("{}", format_fwd_req_log(&method, call_id, dest));
         }
 
         // Forward the request
@@ -508,211 +471,21 @@ impl SipProxy {
     }
 }
 
-/// Parse a SIP URI from a Route or Record-Route header to extract the socket address.
-/// Handles formats like: <sip:host:port;lr>, sip:host:port, etc.
-fn parse_uri_addr(uri: &str) -> Option<SocketAddr> {
-    let uri = uri.trim();
-    // Strip angle brackets
-    let uri = if uri.starts_with('<') && uri.contains('>') {
-        &uri[1..uri.find('>')?]
-    } else {
-        uri
-    };
-    // Strip "sip:" prefix
-    let host_port = uri.strip_prefix("sip:")?;
-    // Strip parameters (;lr, etc.)
-    let host_port = host_port.split(';').next()?;
-    host_port.parse().ok()
-}
-
-/// Parse a Via header to extract the address for response routing.
-/// Via format: SIP/2.0/UDP host:port;branch=xxx
-fn parse_via_addr(via: &str) -> Option<SocketAddr> {
-    let via = via.trim();
-    // Skip "SIP/2.0/UDP " prefix
-    let after_proto = via.split_whitespace().nth(1)?;
-    // Strip parameters to get base host:port
-    let host_port = after_proto.split(';').next()?;
-    let base_addr: SocketAddr = host_port.parse().ok()?;
-
-    // Extract received and rport parameters
-    let mut received_ip: Option<std::net::IpAddr> = None;
-    let mut rport_val: Option<u16> = None;
-
-    for param in after_proto.split(';').skip(1) {
-        let param = param.trim();
-        if let Some(val) = param.strip_prefix("received=") {
-            received_ip = val.parse().ok();
-        } else if let Some(val) = param.strip_prefix("rport=") {
-            rport_val = val.parse().ok();
-        }
-    }
-
-    let ip = received_ip.unwrap_or(base_addr.ip());
-    let port = rport_val.unwrap_or(base_addr.port());
-    Some(SocketAddr::new(ip, port))
-}
-
-/// Generate a random branch suffix for Via headers.
-fn rand_branch() -> String {
-    use rand::Rng;
-    let val: u64 = rand::thread_rng().gen();
-    format!("{:016x}", val)
-}
-
-/// Extract a SIP URI from a header value.
-/// Handles formats like: "<sip:alice@example.com>;tag=xxx" -> "sip:alice@example.com"
-/// or "sip:alice@example.com" -> "sip:alice@example.com"
-fn extract_uri(header_value: &str) -> String {
-    let trimmed = header_value.trim();
-    if let Some(start) = trimmed.find('<') {
-        if let Some(end) = trimmed.find('>') {
-            return trimmed[start + 1..end].to_string();
-        }
-    }
-    // No angle brackets: take up to first ';' or space
-    trimmed.split(';').next().unwrap_or(trimmed).split_whitespace().next().unwrap_or(trimmed).to_string()
-}
-
-/// Method 列挙型を文字列に変換するヘルパー
-fn method_to_str(method: &Method) -> &str {
-    match method {
-        Method::Register => "REGISTER",
-        Method::Invite => "INVITE",
-        Method::Ack => "ACK",
-        Method::Bye => "BYE",
-        Method::Options => "OPTIONS",
-        Method::Update => "UPDATE",
-        Method::Other(s) => s.as_str(),
-    }
-}
-
-/// デバッグログのイベント種別
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DebugEvent {
-    RecvReq,
-    FwdReq,
-    RecvRes,
-    FwdRes,
-    Error,
-}
-
-impl DebugEvent {
-    fn label(&self) -> &'static str {
-        match self {
-            DebugEvent::RecvReq => "RECV_REQ",
-            DebugEvent::FwdReq => "FWD_REQ",
-            DebugEvent::RecvRes => "RECV_RES",
-            DebugEvent::FwdRes => "FWD_RES",
-            DebugEvent::Error => "ERROR",
-        }
-    }
-}
-
-/// リクエスト受信ログのフォーマット
-fn format_recv_req_log(method: &str, request_uri: &str, from: SocketAddr, call_id: &str) -> String {
-    format!(
-        "[DEBUG] {} method={} uri={} from={} call-id={}",
-        DebugEvent::RecvReq.label(),
-        method,
-        request_uri,
-        from,
-        call_id
-    )
-}
-
-/// リクエスト転送ログのフォーマット
-fn format_fwd_req_log(method: &str, call_id: &str, dest: SocketAddr) -> String {
-    format!(
-        "[DEBUG] {} method={} call-id={} dest={}",
-        DebugEvent::FwdReq.label(),
-        method,
-        call_id,
-        dest
-    )
-}
-
-/// レスポンス受信ログのフォーマット
-fn format_recv_res_log(status_code: u16, reason: &str, from: SocketAddr, call_id: &str) -> String {
-    format!(
-        "[DEBUG] {} status={} reason={} from={} call-id={}",
-        DebugEvent::RecvRes.label(),
-        status_code,
-        reason,
-        from,
-        call_id
-    )
-}
-
-/// レスポンス転送ログのフォーマット
-fn format_fwd_res_log(status_code: u16, call_id: &str, dest: SocketAddr) -> String {
-    format!(
-        "[DEBUG] {} status={} call-id={} dest={}",
-        DebugEvent::FwdRes.label(),
-        status_code,
-        call_id,
-        dest
-    )
-}
-
-/// エラーログのフォーマット（リクエスト転送エラー）
-fn format_req_error_log(error: &str, method: &str, call_id: &str, dest: SocketAddr) -> String {
-    format!(
-        "[DEBUG] {} event={} error=\"{}\" method={} call-id={} dest={}",
-        DebugEvent::Error.label(),
-        DebugEvent::FwdReq.label(),
-        error,
-        method,
-        call_id,
-        dest
-    )
-}
-
-/// エラーログのフォーマット（レスポンス転送エラー）
-fn format_res_error_log(error: &str, status_code: u16, call_id: &str, dest: SocketAddr) -> String {
-    format!(
-        "[DEBUG] {} event={} error=\"{}\" status={} call-id={} dest={}",
-        DebugEvent::Error.label(),
-        DebugEvent::FwdRes.label(),
-        error,
-        status_code,
-        call_id,
-        dest
-    )
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sip::message::{Headers, Method, SipMessage, SipRequest, SipResponse};
-    use crate::sip::parser::parse_sip_message;
+    use crate::testutil::MockTransport;
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    /// Mock transport that records all sent messages for verification.
-    struct MockTransport {
-        sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    /// proxy 用の MockTransport ヘルパーメソッド拡張
+    trait MockTransportProxyExt {
+        fn sent_requests(&self) -> Vec<(SipRequest, SocketAddr)>;
+        fn sent_responses(&self) -> Vec<(SipResponse, SocketAddr)>;
     }
 
-    impl MockTransport {
-        fn new() -> Self {
-            Self {
-                sent: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn sent_messages(&self) -> Vec<(SipMessage, SocketAddr)> {
-            self.sent
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(data, addr)| {
-                    parse_sip_message(data).ok().map(|msg| (msg, *addr))
-                })
-                .collect()
-        }
-
+    impl MockTransportProxyExt for MockTransport {
         fn sent_requests(&self) -> Vec<(SipRequest, SocketAddr)> {
             self.sent_messages()
                 .into_iter()
@@ -731,19 +504,6 @@ mod tests {
                     _ => None,
                 })
                 .collect()
-        }
-    }
-
-    impl SipTransport for MockTransport {
-        fn send_to<'a>(
-            &'a self,
-            data: &'a [u8],
-            addr: SocketAddr,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>,
-        > {
-            self.sent.lock().unwrap().push((data.to_vec(), addr));
-            Box::pin(async { Ok(()) })
         }
     }
 
@@ -1252,86 +1012,6 @@ mod tests {
         assert!(req.headers.get("To").is_some());
     }
 
-    // ===== Helper function tests =====
-
-    #[test]
-    fn test_parse_uri_addr_with_angle_brackets_and_lr() {
-        let addr = parse_uri_addr("<sip:10.0.0.2:5060;lr>");
-        assert_eq!(addr, Some("10.0.0.2:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_uri_addr_without_angle_brackets() {
-        let addr = parse_uri_addr("sip:10.0.0.2:5060");
-        assert_eq!(addr, Some("10.0.0.2:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_uri_addr_invalid() {
-        assert!(parse_uri_addr("not-a-uri").is_none());
-    }
-
-    #[test]
-    fn test_parse_via_addr_standard() {
-        let addr = parse_via_addr("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776");
-        assert_eq!(addr, Some("10.0.0.1:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_invalid() {
-        assert!(parse_via_addr("invalid").is_none());
-    }
-
-    // ===== parse_via_addr received/rport tests =====
-
-    #[test]
-    fn test_parse_via_addr_received_only() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;received=192.168.1.1;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("192.168.1.1:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_rport_with_value() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;rport=5062;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("10.0.0.1:5062".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_received_and_rport() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;received=192.168.1.1;rport=5062;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("192.168.1.1:5062".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_rport_without_value() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;rport;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("10.0.0.1:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_no_received_no_rport() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("10.0.0.1:5060".parse().unwrap()));
-    }
-
-    #[test]
-    fn test_parse_via_addr_rport_and_received_reversed_order() {
-        let addr = parse_via_addr(
-            "SIP/2.0/UDP 10.0.0.1:5060;rport=5062;received=192.168.1.1;branch=z9hG4bK776",
-        );
-        assert_eq!(addr, Some("192.168.1.1:5062".parse().unwrap()));
-    }
-
     // ===== is_local_domain tests =====
 
     #[test]
@@ -1364,77 +1044,6 @@ mod tests {
         assert!(proxy.is_local_domain("bob@10.0.0.100"));
     }
 
-    // ===== LocationService unit tests =====
-
-    #[test]
-    fn test_location_service_register_and_lookup() {
-        let ls = LocationService::new();
-        let contact = ContactInfo {
-            contact_uri: "sip:alice@10.0.0.1:5060".to_string(),
-            address: "10.0.0.1:5060".parse().unwrap(),
-            expires: Instant::now() + std::time::Duration::from_secs(3600),
-        };
-        ls.register("sip:alice@example.com", contact);
-
-        let result = ls.lookup("sip:alice@example.com");
-        assert!(result.is_some());
-        let info = result.unwrap();
-        assert_eq!(info.contact_uri, "sip:alice@10.0.0.1:5060");
-        assert_eq!(info.address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
-    }
-
-    #[test]
-    fn test_location_service_lookup_unregistered_returns_none() {
-        let ls = LocationService::new();
-        assert!(ls.lookup("sip:unknown@example.com").is_none());
-    }
-
-    #[test]
-    fn test_location_service_register_overwrites_previous() {
-        let ls = LocationService::new();
-        let contact1 = ContactInfo {
-            contact_uri: "sip:alice@10.0.0.1:5060".to_string(),
-            address: "10.0.0.1:5060".parse().unwrap(),
-            expires: Instant::now() + std::time::Duration::from_secs(3600),
-        };
-        ls.register("sip:alice@example.com", contact1);
-
-        let contact2 = ContactInfo {
-            contact_uri: "sip:alice@10.0.0.2:5060".to_string(),
-            address: "10.0.0.2:5060".parse().unwrap(),
-            expires: Instant::now() + std::time::Duration::from_secs(3600),
-        };
-        ls.register("sip:alice@example.com", contact2);
-
-        let result = ls.lookup("sip:alice@example.com").unwrap();
-        assert_eq!(result.contact_uri, "sip:alice@10.0.0.2:5060");
-    }
-
-    // ===== extract_uri helper tests =====
-
-    #[test]
-    fn test_extract_uri_with_angle_brackets_and_tag() {
-        assert_eq!(
-            extract_uri("<sip:alice@example.com>;tag=1928301774"),
-            "sip:alice@example.com"
-        );
-    }
-
-    #[test]
-    fn test_extract_uri_with_angle_brackets_only() {
-        assert_eq!(
-            extract_uri("<sip:bob@example.com>"),
-            "sip:bob@example.com"
-        );
-    }
-
-    #[test]
-    fn test_extract_uri_without_angle_brackets() {
-        assert_eq!(
-            extract_uri("sip:alice@example.com"),
-            "sip:alice@example.com"
-        );
-    }
 
     // ===== Req 19.6: REGISTER stores in LocationService and returns 200 OK =====
 
@@ -2182,93 +1791,21 @@ mod tests {
 
     // ===== DebugEvent label テスト =====
 
-    #[test]
-    fn test_debug_event_labels() {
-        assert_eq!(DebugEvent::RecvReq.label(), "RECV_REQ");
-        assert_eq!(DebugEvent::FwdReq.label(), "FWD_REQ");
-        assert_eq!(DebugEvent::RecvRes.label(), "RECV_RES");
-        assert_eq!(DebugEvent::FwdRes.label(), "FWD_RES");
-        assert_eq!(DebugEvent::Error.label(), "ERROR");
-    }
-
-    // ===== フォーマット関数のユニットテスト =====
-    // Requirements: 2.1, 2.2, 3.1, 3.2, 4.1, 4.2, 5.1, 5.2, 6.1, 6.2, 7.1, 7.2
+    // ===== Method Display テスト (method_to_str 置き換え) =====
 
     #[test]
-    fn test_format_recv_req_log() {
-        let from: SocketAddr = "192.168.1.1:5060".parse().unwrap();
-        let result = format_recv_req_log("INVITE", "sip:bob@example.com", from, "abc123@host");
-        assert_eq!(
-            result,
-            "[DEBUG] RECV_REQ method=INVITE uri=sip:bob@example.com from=192.168.1.1:5060 call-id=abc123@host"
-        );
+    fn test_method_display_known_methods() {
+        assert_eq!(Method::Register.to_string(), "REGISTER");
+        assert_eq!(Method::Invite.to_string(), "INVITE");
+        assert_eq!(Method::Ack.to_string(), "ACK");
+        assert_eq!(Method::Bye.to_string(), "BYE");
+        assert_eq!(Method::Options.to_string(), "OPTIONS");
+        assert_eq!(Method::Update.to_string(), "UPDATE");
     }
 
     #[test]
-    fn test_format_fwd_req_log() {
-        let dest: SocketAddr = "10.0.0.1:5080".parse().unwrap();
-        let result = format_fwd_req_log("INVITE", "abc123@host", dest);
-        assert_eq!(
-            result,
-            "[DEBUG] FWD_REQ method=INVITE call-id=abc123@host dest=10.0.0.1:5080"
-        );
-    }
-
-    #[test]
-    fn test_format_recv_res_log() {
-        let from: SocketAddr = "10.0.0.1:5080".parse().unwrap();
-        let result = format_recv_res_log(200, "OK", from, "abc123@host");
-        assert_eq!(
-            result,
-            "[DEBUG] RECV_RES status=200 reason=OK from=10.0.0.1:5080 call-id=abc123@host"
-        );
-    }
-
-    #[test]
-    fn test_format_fwd_res_log() {
-        let dest: SocketAddr = "192.168.1.1:5060".parse().unwrap();
-        let result = format_fwd_res_log(200, "abc123@host", dest);
-        assert_eq!(
-            result,
-            "[DEBUG] FWD_RES status=200 call-id=abc123@host dest=192.168.1.1:5060"
-        );
-    }
-
-    #[test]
-    fn test_format_req_error_log() {
-        let dest: SocketAddr = "10.0.0.1:5080".parse().unwrap();
-        let result = format_req_error_log("connection refused", "INVITE", "abc123@host", dest);
-        assert_eq!(
-            result,
-            "[DEBUG] ERROR event=FWD_REQ error=\"connection refused\" method=INVITE call-id=abc123@host dest=10.0.0.1:5080"
-        );
-    }
-
-    #[test]
-    fn test_format_res_error_log() {
-        let dest: SocketAddr = "192.168.1.1:5060".parse().unwrap();
-        let result = format_res_error_log("connection refused", 200, "abc123@host", dest);
-        assert_eq!(
-            result,
-            "[DEBUG] ERROR event=FWD_RES error=\"connection refused\" status=200 call-id=abc123@host dest=192.168.1.1:5060"
-        );
-    }
-
-    // ===== method_to_str ヘルパー関数テスト =====
-
-    #[test]
-    fn test_method_to_str_known_methods() {
-        assert_eq!(method_to_str(&Method::Register), "REGISTER");
-        assert_eq!(method_to_str(&Method::Invite), "INVITE");
-        assert_eq!(method_to_str(&Method::Ack), "ACK");
-        assert_eq!(method_to_str(&Method::Bye), "BYE");
-        assert_eq!(method_to_str(&Method::Options), "OPTIONS");
-        assert_eq!(method_to_str(&Method::Update), "UPDATE");
-    }
-
-    #[test]
-    fn test_method_to_str_other() {
-        assert_eq!(method_to_str(&Method::Other("SUBSCRIBE".to_string())), "SUBSCRIBE");
+    fn test_method_display_other() {
+        assert_eq!(Method::Other("SUBSCRIBE".to_string()).to_string(), "SUBSCRIBE");
     }
 
     // ===== handle_request デバッグログ統合テスト =====
@@ -2505,39 +2042,6 @@ mod tests {
 
 
 
-    // ===== Task 12.1: プロキシのバッファ再利用・高速RNG テスト =====
-
-    #[test]
-    fn test_rand_branch_returns_16_char_hex_string() {
-        // rand_branch() は u64 ベースの16文字16進数文字列を返すべき
-        let branch = rand_branch();
-        assert_eq!(
-            branch.len(),
-            16,
-            "rand_branch should return 16-char hex string, got: '{}'",
-            branch
-        );
-        assert!(
-            branch.chars().all(|c| c.is_ascii_hexdigit()),
-            "rand_branch should contain only hex digits, got: '{}'",
-            branch
-        );
-    }
-
-    #[test]
-    fn test_rand_branch_produces_unique_values() {
-        // 連続生成で一意な値を返すべき（SystemTimeベースでは衝突リスクあり）
-        let mut branches: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for _ in 0..100 {
-            let branch = rand_branch();
-            branches.insert(branch);
-        }
-        assert_eq!(
-            branches.len(),
-            100,
-            "100 consecutive rand_branch() calls should produce 100 unique values"
-        );
-    }
 
     #[tokio::test]
     async fn test_forward_request_uses_format_into_compatible_output() {
@@ -4061,7 +3565,7 @@ mod tests {
     fn test_proxy_initializes_with_message_pool() {
         let transport = Arc::new(MockTransport::new());
         let pool = Arc::new(MessagePool::new(8));
-        let proxy = SipProxy::new(
+        let _proxy = SipProxy::new(
             transport,
             Arc::new(LocationService::new()),
             None,
@@ -4081,7 +3585,7 @@ mod tests {
         let proxy = make_proxy_with_pool(transport.clone());
 
         let invite = make_invite("call-pool-1");
-        proxy.handle_request(invite, uac_addr()).await;
+        let _ = proxy.handle_request(invite, uac_addr()).await;
 
         let sent = transport.sent_requests();
         assert_eq!(sent.len(), 1);
@@ -4097,7 +3601,7 @@ mod tests {
         let proxy = make_proxy_with_pool(transport.clone());
 
         let response = make_200ok_response("call-pool-2");
-        proxy.handle_response(response, uas_addr()).await;
+        let _ = proxy.handle_response(response, uas_addr()).await;
 
         let sent = transport.sent_responses();
         assert_eq!(sent.len(), 1);
@@ -4113,7 +3617,7 @@ mod tests {
 
         // リクエスト転送: Viaが追加されること
         let invite = make_invite("call-pool-via");
-        proxy.handle_request(invite, uac_addr()).await;
+        let _ = proxy.handle_request(invite, uac_addr()).await;
 
         let sent = transport.sent_requests();
         assert_eq!(sent.len(), 1);
@@ -4131,7 +3635,7 @@ mod tests {
         let proxy = make_proxy_with_pool(transport.clone());
 
         let invite = make_invite("call-pool-rr");
-        proxy.handle_request(invite, uac_addr()).await;
+        let _ = proxy.handle_request(invite, uac_addr()).await;
 
         let sent = transport.sent_requests();
         assert_eq!(sent.len(), 1);
@@ -4156,7 +3660,7 @@ mod tests {
         );
 
         let register = make_register("call-pool-reg");
-        proxy.handle_request(register, uac_addr()).await;
+        let _ = proxy.handle_request(register, uac_addr()).await;
 
         // 200 OK が返されること
         let sent = transport.sent_responses();
@@ -4184,7 +3688,7 @@ mod tests {
 
         // 認証なしINVITEは407を返すこと
         let invite = make_invite("call-pool-auth");
-        proxy.handle_request(invite, uac_addr()).await;
+        let _ = proxy.handle_request(invite, uac_addr()).await;
 
         let sent = transport.sent_responses();
         assert_eq!(sent.len(), 1);

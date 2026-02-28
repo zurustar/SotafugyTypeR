@@ -1,6 +1,3 @@
-// UDP transport module
-
-pub mod batch;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,6 +5,15 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use crate::error::SipLoadTestError;
+
+/// Transport trait to abstract UDP sending for testability.
+pub trait SipTransport: Send + Sync {
+    fn send_to<'a>(
+        &'a self,
+        data: &'a [u8],
+        addr: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>>;
+}
 
 pub struct UdpTransport {
     sockets: Vec<Arc<UdpSocket>>,
@@ -82,6 +88,17 @@ impl UdpTransport {
         let mut buf = [0u8; 65535];
         let (len, from) = socket.recv_from(&mut buf).await?;
         Ok((buf[..len].to_vec(), from))
+    }
+}
+
+/// Real UDP transport adapter
+impl SipTransport for UdpTransport {
+    fn send_to<'a>(
+        &'a self,
+        data: &'a [u8],
+        addr: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SipLoadTestError>> + Send + 'a>> {
+        Box::pin(self.send_to(data, addr))
     }
 }
 
